@@ -18,7 +18,7 @@ come from the cached runs. For per-kernel device timing and bottleneck metrics
 use the tt-metal device profiler (Tracy) separately — see GUIDE.md.
 
 Usage:
-    python bench/kernelbench/bench.py --ref <ref-path> --solution solution/<kernel> [options]
+    python3 bench/kernelbench/bench.py --ref <ref-path> --solution solution/<kernel> [options]
 
 Output (structured, one per line):
     COMPILED: True/False
@@ -81,6 +81,28 @@ EXCESSIVE_SPEEDUP_THRESHOLD = 100.0
 import torch
 import torch.nn as nn
 
+# --- Trust boundary note -----------------------------------------------------
+# The solution is UNTRUSTED code that is imported (its module-level code runs)
+# in this same interpreter. Defense-in-depth here: (1) the reference goldens are
+# computed BEFORE the solution is imported; (2) the timer and the torch ops used
+# to score correctness are captured below, before any solution code runs, so a
+# solution that monkey-patches `time.perf_counter` / `torch.*` after import
+# cannot redirect them; (3) correctness is re-verified after the timing phase.
+# This does NOT make execution safe against a hostile solution (method-level
+# patching, os-level actions, etc. remain possible) — for untrusted input run
+# the bench inside a container/sandbox. A full guarantee needs subprocess
+# isolation of the solution's forward.
+_perf_counter = time.perf_counter
+_t_corrcoef = torch.corrcoef
+_t_nan_to_num = torch.nan_to_num
+_t_isclose = torch.isclose
+_t_equal = torch.equal
+_t_all = torch.all
+_t_isnan = torch.isnan
+_t_isinf = torch.isinf
+_t_stack = torch.stack
+_t_vecnorm = torch.linalg.vector_norm
+
 
 ###############################################################################
 # Device handle injected into solutions
@@ -122,12 +144,15 @@ def comp_pcc(golden: torch.Tensor, calculated: torch.Tensor, pcc: float = 0.99):
     correctness metric (see tt-metal ``models.common.utility_functions.comp_pcc``).
 
     Returns ``(passing: bool, pcc_value: float)``. NaN/Inf entries are masked to
-    zero before correlating; constant tensors are compared on their max value;
+    zero before correlating; constant tensors are compared on their mean value;
     identical tensors and all-NaN-vs-all-NaN return 1.0.
 
     PCC (not a tight allclose) is used because TT kernels run in bfloat16 /
     bfloat8_b, whose few mantissa bits make element-wise agreement to fp32-grade
     tolerance physically impossible even for a correct kernel.
+
+    Uses the torch functions captured at module import (``_t_*``) so a solution
+    that monkey-patches ``torch.*`` after being imported cannot corrupt scoring.
     """
     golden = golden.detach().flatten().to(torch.float32)
     calculated = calculated.detach().flatten().to(torch.float32)
@@ -135,14 +160,14 @@ def comp_pcc(golden: torch.Tensor, calculated: torch.Tensor, pcc: float = 0.99):
     if golden.shape != calculated.shape:
         return False, 0.0
 
-    g_all_nan = bool(torch.all(torch.isnan(golden)))
-    c_all_nan = bool(torch.all(torch.isnan(calculated)))
+    g_all_nan = bool(_t_all(_t_isnan(golden)))
+    c_all_nan = bool(_t_all(_t_isnan(calculated)))
     if g_all_nan and c_all_nan:
         return True, 1.0
     if g_all_nan or c_all_nan:
         return False, 0.0
 
-    if torch.equal(golden, calculated):
+    if _t_equal(golden, calculated):
         return True, 1.0
 
     # Zero each tensor's OWN non-finite entries independently (matches tt-metal's
@@ -150,8 +175,8 @@ def comp_pcc(golden: torch.Tensor, calculated: torch.Tensor, pcc: float = 0.99):
     # the golden wherever the *solution* emitted NaN/Inf, hiding the divergence
     # and inflating PCC to a false pass — a NaN-producing kernel would score
     # correct.
-    golden = torch.nan_to_num(golden, nan=0.0, posinf=0.0, neginf=0.0)
-    calculated = torch.nan_to_num(calculated, nan=0.0, posinf=0.0, neginf=0.0)
+    golden = _t_nan_to_num(golden, nan=0.0, posinf=0.0, neginf=0.0)
+    calculated = _t_nan_to_num(calculated, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Pearson correlation is undefined when a tensor has zero variance. Shapes
     # already match here, so numel<2 means both are scalars.
@@ -164,14 +189,14 @@ def comp_pcc(golden: torch.Tensor, calculated: torch.Tensor, pcc: float = 0.99):
             # which are unreachable in bf16 and would false-fail a correct
             # low-precision kernel.
             close = bool(
-                torch.isclose(golden.mean(), calculated.mean(), rtol=2e-2, atol=1e-2)
+                _t_isclose(golden.mean(), calculated.mean(), rtol=2e-2, atol=1e-2)
             )
             return close, (1.0 if close else 0.0)
         # Exactly one side is constant while the other varies — a genuine
         # mismatch (e.g. a solution returning a constant vs a varying golden).
         return False, 0.0
 
-    cc = torch.corrcoef(torch.stack([golden, calculated]))[0, 1].item()
+    cc = _t_corrcoef(_t_stack([golden, calculated]))[0, 1].item()
     if math.isnan(cc):
         return False, 0.0
     return cc >= pcc, float(cc)
@@ -187,12 +212,12 @@ def relative_l2_error(golden: torch.Tensor, calculated: torch.Tensor) -> float:
     rounding noise (typically a few %), so the two together catch a broad class
     of wrong-but-correlated outputs.
     """
-    g = torch.nan_to_num(golden.detach().flatten().to(torch.float32))
-    c = torch.nan_to_num(calculated.detach().flatten().to(torch.float32))
+    g = _t_nan_to_num(golden.detach().flatten().to(torch.float32))
+    c = _t_nan_to_num(calculated.detach().flatten().to(torch.float32))
     if g.shape != c.shape:
         return float("inf")
-    denom = torch.linalg.vector_norm(g).item()
-    num = torch.linalg.vector_norm(g - c).item()
+    denom = _t_vecnorm(g).item()
+    num = _t_vecnorm(g - c).item()
     if denom == 0.0:
         # golden is all-zero: fall back to the absolute error magnitude.
         return num
@@ -221,6 +246,11 @@ def time_execution_host(
     effects). ``device`` may be None (CPU reference), in which case no device
     sync is performed. The first ``discard_first`` trials are dropped; on TT the
     very first run JIT-compiles kernels and fills the program cache.
+
+    The output is passed through ``_to_torch`` INSIDE the timed region: if the
+    solution returns a raw ttnn.Tensor, the device->host readback is part of the
+    reported end-to-end RUNTIME (and a solution can't dodge the transfer cost by
+    skipping to_torch). Uses the module-captured timer ``_perf_counter``.
     """
     ttnn = None
     if device is not None:
@@ -232,20 +262,21 @@ def time_execution_host(
 
     # Warm up: triggers kernel JIT build + program-cache population on TT.
     for _ in range(num_warmup):
-        kernel_fn(*make_args())
+        _to_torch(kernel_fn(*make_args()))
         _sync()
 
     if verbose and device is not None:
         print(f"[Profiling] Host timing on TT device, warmup {num_warmup}, trials {num_trials}")
 
     elapsed_times: list[float] = []
+    sink = None  # keep a reference so the call isn't dead-code-eliminated
     for trial in range(num_trials + discard_first):
         args = make_args()
         _sync()
-        start = time.perf_counter()
-        _ = kernel_fn(*args)
+        start = _perf_counter()
+        sink = _to_torch(kernel_fn(*args))
         _sync()
-        end = time.perf_counter()
+        end = _perf_counter()
 
         elapsed_ms = (end - start) * 1000.0
         if trial >= discard_first:
@@ -253,6 +284,7 @@ def time_execution_host(
                 print(f"Trial {trial - discard_first + 1}: {elapsed_ms:.3g} ms")
             elapsed_times.append(elapsed_ms)
 
+    del sink
     return elapsed_times
 
 
@@ -355,12 +387,20 @@ def load_solution_model(
     # Inject the device before executing module-level code so top-level setup can
     # use it too.
     setattr(module, "DEVICE", device)
+    # Don't let the import write a __pycache__/*.pyc beside the (uniquely-named,
+    # about-to-be-deleted) temp file: cleanup only removes the .py, so the .pyc
+    # would orphan and accumulate in the user's solution/ dir and get copied into
+    # every trajectory snapshot. Disabling covers both the success and error paths.
+    _prev_dwb = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
     try:
         spec.loader.exec_module(module)
     except Exception:
         # Surface the import/compile failure to the caller; clean up the temp file.
         os.remove(tmp_path)
         raise
+    finally:
+        sys.dont_write_bytecode = _prev_dwb
 
     return getattr(module, entry_point, None), tmp_path
 
@@ -390,99 +430,62 @@ def register_and_format_exception(
     return metadata
 
 
+def _clone_inputs(inputs):
+    """Deep copy an inputs list so a consumer cannot mutate the original."""
+    return [
+        x.clone() if isinstance(x, torch.Tensor) else copy.deepcopy(x) for x in inputs
+    ]
+
+
+def _compare_output(ref_cpu, sol_output, pcc_threshold, rel_tol):
+    """Compare a solution output against a precomputed CPU golden.
+
+    Returns (passing, pcc_val, rel_err, reasons). Correctness = PCC gate AND
+    relative-L2 magnitude gate: PCC alone is blind to a global scale/bias
+    (output×2 scores PCC≈1); relative L2 catches that while tolerating
+    bf16/bfloat8_b rounding noise.
+    """
+    sol_cpu = _to_torch(sol_output).detach().to(torch.float32).cpu()
+    if ref_cpu.shape != sol_cpu.shape:
+        return False, 0.0, float("inf"), [
+            f"shape mismatch: expected {ref_cpu.shape}, got {sol_cpu.shape}"
+        ]
+    passing_pcc, pcc_val = comp_pcc(ref_cpu, sol_cpu, pcc_threshold)
+    rel_err = relative_l2_error(ref_cpu, sol_cpu)
+    reasons = []
+    if not passing_pcc:
+        reasons.append(f"PCC {pcc_val:.6f} < {pcc_threshold}")
+    if rel_err > rel_tol:
+        reasons.append(f"rel_err {rel_err:.4f} > {rel_tol}")
+    return (passing_pcc and rel_err <= rel_tol), pcc_val, rel_err, reasons
+
+
 def run_and_check_correctness(
-    original_model_instance: nn.Module,
     new_model_instance: nn.Module,
-    get_inputs_fn: callable,
+    golden_trials: list,
     metadata: dict,
-    num_correct_trials: int,
     pcc_threshold: float,
     rel_tol: float = 0.1,
     verbose: bool = False,
-    seed: int = 42,
 ) -> KernelExecResult:
-    """Run reference (CPU) and solution (TT) over fresh-input trials, comparing
-    with PCC plus a relative-L2 magnitude guard. The reference is the golden; the
-    checks on fresh random inputs are the anti-cheat (a constant / precomputed /
-    scaled output fails)."""
+    """Score the solution (TT) against precomputed CPU goldens with PCC + a
+    relative-L2 magnitude guard.
+
+    ``golden_trials`` is a list of ``(sol_inputs, ref_cpu_output)`` pairs computed
+    by the reference on CPU BEFORE the untrusted solution was imported (so a
+    solution that monkey-patches torch cannot corrupt the golden). The checks run
+    on fresh random inputs per trial — the anti-cheat: a constant / precomputed /
+    scaled output fails.
+    """
     pass_count = 0
     min_pcc = 1.0
     max_rel_err = 0.0
-
-    torch.manual_seed(seed)
-    trial_seeds = [
-        torch.randint(0, 2**31 - 1, (1,)).item() for _ in range(num_correct_trials)
-    ]
+    n = len(golden_trials)
 
     with torch.no_grad():
-        for trial in range(num_correct_trials):
-            trial_seed = trial_seeds[trial]
-            if verbose:
-                print(f"[Eval] Generating random input with seed {trial_seed}")
-
-            # Generate the inputs ONCE, then deep-copy for the solution. Calling
-            # get_inputs() a second time would diverge whenever it uses numpy /
-            # random / a counter (only torch's RNG is reset here), scoring the
-            # reference and solution on different data. The copy also stops the
-            # solution from mutating the reference's tensors in place.
-            set_seed(trial_seed)
-            ref_inputs = get_inputs_fn()
-            sol_inputs = [
-                x.clone() if isinstance(x, torch.Tensor) else copy.deepcopy(x)
-                for x in ref_inputs
-            ]
-
-            ref_output = original_model_instance(*ref_inputs)
-
+        for trial, (sol_inputs, ref_cpu) in enumerate(golden_trials):
             try:
-                sol_output = _to_torch(new_model_instance(*sol_inputs))
-
-                if not isinstance(ref_output, torch.Tensor):
-                    metadata["correctness_issue"] = "Reference did not return a tensor"
-                    return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
-
-                ref_cpu = ref_output.detach().to(torch.float32).cpu()
-                sol_cpu = sol_output.detach().to(torch.float32).cpu()
-
-                if ref_cpu.shape != sol_cpu.shape:
-                    register_and_format_exception(
-                        "correctness_issue",
-                        f"Output shape mismatch: expected {ref_cpu.shape}, got {sol_cpu.shape}",
-                        metadata,
-                    )
-                    if verbose:
-                        print(
-                            f"[FAIL] trial {trial}: shape mismatch "
-                            f"{ref_cpu.shape} vs {sol_cpu.shape}"
-                        )
-                    return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
-
-                # Correctness = PCC gate AND magnitude gate. PCC alone is blind
-                # to a global scale/bias (output×2 scores PCC≈1); relative L2
-                # catches that while tolerating bf16/bfloat8_b rounding noise.
-                passing_pcc, pcc_val = comp_pcc(ref_cpu, sol_cpu, pcc_threshold)
-                rel_err = relative_l2_error(ref_cpu, sol_cpu)
-                min_pcc = min(min_pcc, pcc_val)
-                max_rel_err = max(max_rel_err, rel_err)
-                passing = passing_pcc and rel_err <= rel_tol
-                if passing:
-                    pass_count += 1
-                    if verbose:
-                        print(
-                            f"[PASS] trial {trial}: PCC {pcc_val:.6f} >= {pcc_threshold}, "
-                            f"rel_err {rel_err:.4f} <= {rel_tol}"
-                        )
-                else:
-                    reasons = []
-                    if not passing_pcc:
-                        reasons.append(f"PCC {pcc_val:.6f} < {pcc_threshold}")
-                    if rel_err > rel_tol:
-                        reasons.append(f"rel_err {rel_err:.4f} > {rel_tol}")
-                    metadata.setdefault("pcc_values", []).append(f"{pcc_val:.6f}")
-                    metadata["correctness_issue"] = "; ".join(reasons)
-                    if verbose:
-                        print(f"[FAIL] trial {trial}: {'; '.join(reasons)}")
-
+                sol_output = new_model_instance(*_clone_inputs(sol_inputs))
             except Exception as e:
                 print("[Error] Exception during correctness check")
                 print(f"Error running solution ModelNew: {e}")
@@ -494,12 +497,29 @@ def run_and_check_correctness(
                 metadata["runtime_error_traceback"] = traceback.format_exc()
                 return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
 
-    metadata["correctness_trials"] = f"({pass_count} / {num_correct_trials})"
+            passing, pcc_val, rel_err, reasons = _compare_output(
+                ref_cpu, sol_output, pcc_threshold, rel_tol
+            )
+            min_pcc = min(min_pcc, pcc_val)
+            max_rel_err = max(max_rel_err, rel_err)
+            if passing:
+                pass_count += 1
+                if verbose:
+                    print(
+                        f"[PASS] trial {trial}: PCC {pcc_val:.6f} >= {pcc_threshold}, "
+                        f"rel_err {rel_err:.4f} <= {rel_tol}"
+                    )
+            else:
+                metadata.setdefault("pcc_values", []).append(f"{pcc_val:.6f}")
+                metadata["correctness_issue"] = "; ".join(reasons)
+                if verbose:
+                    print(f"[FAIL] trial {trial}: {'; '.join(reasons)}")
+
+    metadata["correctness_trials"] = f"({pass_count} / {n})"
     metadata["min_pcc"] = f"{min_pcc:.6f}"
     metadata["max_rel_err"] = f"{max_rel_err:.6f}"
-    correct = pass_count == num_correct_trials
     return KernelExecResult(
-        compiled=True, correctness=correct, pcc=min_pcc, metadata=metadata
+        compiled=True, correctness=(pass_count == n), pcc=min_pcc, metadata=metadata
     )
 
 
@@ -620,6 +640,37 @@ def eval_kernel_against_ref(
             metadata["error_message"] = str(e)
             return KernelExecResult(compiled=False, metadata=metadata)
 
+        # --- Precompute reference goldens on CPU, BEFORE importing the untrusted
+        # solution, so a solution that monkey-patches torch cannot corrupt the
+        # golden. Generates num_correct_trials + 1 trials; the extra "holdout"
+        # is used to re-verify after the timing phase. A reference-side failure
+        # is recorded under its own key (reference_error), never the solution's. ---
+        if verbose:
+            print("[Eval] Precomputing reference goldens (CPU)")
+        torch.manual_seed(seed_num)
+        n_gold = num_correct_trials + 1
+        trial_seeds = [torch.randint(0, 2**31 - 1, (1,)).item() for _ in range(n_gold)]
+        golden_trials = []
+        try:
+            with torch.no_grad():
+                for ts in trial_seeds:
+                    set_seed(ts)
+                    inp = get_inputs()
+                    sol_inp = _clone_inputs(inp)  # pristine copy for the solution
+                    ref_out = original_model(*inp)
+                    if not isinstance(ref_out, torch.Tensor):
+                        metadata["error"] = "reference_not_tensor"
+                        metadata["error_message"] = "Reference forward did not return a tensor"
+                        return KernelExecResult(compiled=False, metadata=metadata)
+                    golden_trials.append(
+                        (sol_inp, ref_out.detach().to(torch.float32).cpu())
+                    )
+        except Exception as e:
+            print(f"Reference forward failed while computing golden: {e}")
+            register_and_format_exception("reference_error", e, metadata, truncate=True)
+            metadata["reference_error_name"] = get_error_name(e)
+            return KernelExecResult(compiled=False, metadata=metadata)
+
         # --- Load + build solution (TT) ---
         if verbose:
             print("[Eval] Loading solution model (TT device)")
@@ -658,15 +709,12 @@ def eval_kernel_against_ref(
             print("[Eval] Checking correctness (PCC)")
         try:
             result = run_and_check_correctness(
-                original_model,
                 custom_model,
-                get_inputs,
+                golden_trials[:num_correct_trials],
                 metadata=metadata,
-                num_correct_trials=num_correct_trials,
                 pcc_threshold=pcc_threshold,
                 rel_tol=rel_tol,
                 verbose=verbose,
-                seed=seed_num,
             )
         except Exception as e:
             metadata["runtime_error"] = str(e)
@@ -720,6 +768,33 @@ def eval_kernel_against_ref(
                 if verbose:
                     print(f"[Eval] Error measuring reference performance: {e}")
                 result.metadata["error_during_ref_performance"] = str(e)
+
+        # --- Re-verify after timing: run the solution once more on the holdout
+        # golden (computed pre-import). Catches a stateful forward that computes
+        # correctly during the correctness trials, then short-circuits (returns a
+        # cached/trivial tensor) during the timing phase for a fraudulently low
+        # RUNTIME. Done OUTSIDE any timed region. ---
+        if result.correctness:
+            try:
+                holdout_inp, holdout_ref = golden_trials[num_correct_trials]
+                with torch.no_grad():
+                    holdout_out = custom_model(*_clone_inputs(holdout_inp))
+                passing, pcc_val, rel_err, reasons = _compare_output(
+                    holdout_ref, holdout_out, pcc_threshold, rel_tol
+                )
+                result.metadata["reverify_pcc"] = f"{pcc_val:.6f}"
+                if not passing:
+                    result.correctness = False
+                    result.pcc = min(result.pcc, pcc_val)  # headline PCC reflects the failure
+                    result.metadata["reverify_failed"] = "; ".join(reasons)
+                    print(
+                        f"[WARNING] Post-timing re-verify FAILED ({'; '.join(reasons)}) — "
+                        "the solution's output changed after the correctness phase "
+                        "(possible stateful short-circuit). Marking INCORRECT."
+                    )
+            except Exception as e:
+                result.correctness = False
+                result.metadata["reverify_error"] = str(e)
 
         return result
 
@@ -776,41 +851,46 @@ def rename_model_to_modelnew(src: str) -> str:
     return "".join(lines)
 
 
-def _find_tail_section(src: str) -> int:
-    """Find char offset where module-level code after the *last* class begins
-    (variables like N=2048, get_inputs(), get_init_inputs())."""
+def _strip_input_defs(src: str) -> str:
+    """Remove any TOP-LEVEL ``get_inputs`` / ``get_init_inputs`` function from the
+    solution, keeping everything else (helper functions, constants, other classes).
+
+    This is the anti-cheat boundary: those two functions define the test inputs,
+    which must come from the reference / --inputs file, never the solution.
+
+    It deliberately does NOT strip the whole post-class tail (the old KernelBench
+    behavior): a ttnn / tt-metal solution commonly defines helper functions or
+    weight/config constants after ``class Model``, and deleting them caused
+    confusing silent NameErrors at eval. Only the two input-providing functions
+    (matched at column 0) are removed; a ``def get_inputs(self)`` method inside a
+    class is indented and thus preserved.
+    """
     lines = src.split("\n")
-    last_class_idx = -1
-
-    for i, line in enumerate(lines):
-        if re.match(r"^class\s+", line):
-            last_class_idx = i
-
-    if last_class_idx == -1:
-        return len(src)
-
-    for i in range(last_class_idx + 1, len(lines)):
-        line = lines[i]
-        if line.strip() == "" or (line and line[0] in (" ", "\t")):
+    pat = re.compile(r"^(async\s+)?def\s+(get_inputs|get_init_inputs)\s*\(")
+    out = []
+    i, n = 0, len(lines)
+    while i < n:
+        if pat.match(lines[i]):
+            i += 1  # skip the def line, then its indented body / blank lines
+            while i < n and (lines[i].strip() == "" or lines[i][:1] in (" ", "\t")):
+                i += 1
             continue
-        return sum(len(l) + 1 for l in lines[:i])
-
-    return len(src)
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
 
 
 def prepare_solution_source(sol_src: str) -> str:
     """Prepare solution source for eval:
-    1. Rename class Model -> class ModelNew.
-    2. Strip the solution's tail section (module-level vars, get_inputs,
-       get_init_inputs).
+    1. Rename class Model -> class ModelNew (and its references).
+    2. Remove any top-level get_inputs / get_init_inputs definitions.
 
-    The tail strip is the anti-cheat boundary: get_inputs / get_init_inputs come
-    from the reference or the --inputs file, never from the solution, so the
-    solution cannot choose the inputs it is tested against.
+    The strip is the anti-cheat boundary: test inputs come from the reference or
+    the --inputs file, never the solution. Unlike the old whole-tail strip, it
+    keeps legitimate post-class helper functions and constants.
     """
     modified = rename_model_to_modelnew(sol_src)
-    sol_tail_start = _find_tail_section(modified)
-    return modified[:sol_tail_start].rstrip() + "\n"
+    return _strip_input_defs(modified).rstrip() + "\n"
 
 
 def _auto_detect_backend(sol_src: str) -> str:
@@ -887,10 +967,11 @@ def get_init_inputs():
     assert "class ModelNew(" in result, "ModelNew rename failed"
     assert "class Model(" not in result, "Original Model class still present"
     assert "super(ModelNew," in result, "super() rename failed"
-    assert "N = 4096" not in result, "Solution's N must not leak"
     assert "def get_inputs" not in result, "Solution's get_inputs must be stripped"
     assert "def get_init_inputs" not in result, "Solution's get_init_inputs must be stripped"
     assert "return [42]" not in result, "Solution's get_init_inputs body must be stripped"
+    # Targeted strip keeps module-level constants (only the two input functions go).
+    assert "N = 4096" in result, "post-class constant must be kept"
     print("Self-test PASSED: source transformation is correct.")
 
     # --- Multi-class regression ---
@@ -923,15 +1004,36 @@ def get_init_inputs():
     assert "class Helper(" in result_multi, "Helper class should be preserved"
     assert "class ModelNew(" in result_multi, "ModelNew rename failed (multi-class)"
     assert "def helper_fn" in result_multi, "helper_fn should be preserved"
-    assert "N = 4096" not in result_multi, "Solution's N must not leak (multi-class)"
     assert "def get_inputs" not in result_multi, "Solution's get_inputs must be stripped (multi-class)"
+    assert "def get_init_inputs" not in result_multi, "get_init_inputs must be stripped (multi-class)"
     print("Self-test PASSED: multi-class transformation is correct.")
 
-    # --- No-class edge case ---
-    no_class_src = "import torch\nN = 1\n"
-    assert _find_tail_section(no_class_src) == len(no_class_src), \
-        "No class: entire source should be kept (offset == len)"
-    print("Self-test PASSED: no-class edge case.")
+    # --- Targeted strip keeps legitimate post-class helpers/constants ---
+    sol_helper = '''import torch, torch.nn as nn
+
+class Model(nn.Module):
+    def forward(self, x):
+        return _tt_scale(x, W)
+
+W = 3.0
+
+def _tt_scale(x, w):
+    return x * w
+
+def get_inputs():
+    return [torch.randn(8)]
+'''
+    r_help = prepare_solution_source(sol_helper)
+    assert "def _tt_scale" in r_help, "post-class helper must be kept"
+    assert "W = 3.0" in r_help, "post-class constant must be kept"
+    assert "def get_inputs" not in r_help, "get_inputs must be stripped"
+    # A get_inputs *method* (indented) must be preserved.
+    r_method = _strip_input_defs("class M:\n    def get_inputs(self):\n        return 1\n")
+    assert "def get_inputs(self)" in r_method, "indented get_inputs method must be kept"
+    # No-class source: get_inputs stripped, other top-level code kept.
+    r_noclass = prepare_solution_source("import torch\nK = 1\n\ndef get_inputs():\n    return [K]\n")
+    assert "K = 1" in r_noclass and "def get_inputs" not in r_noclass, "no-class strip"
+    print("Self-test PASSED: targeted input-def strip keeps helpers/constants.")
 
     # --- Backend auto-detection ---
     assert _auto_detect_backend("import ttnn\nx = ttnn.matmul(a, b)") == "ttnn", \
@@ -1153,8 +1255,24 @@ def main():
     if args.num_perf_trials < 1:
         parser.error("--num-perf-trials must be >= 1")
 
-    ref_src = read_file(args.ref)
-    sol_src = read_file(args.solution)
+    def _fail(msg):
+        # Emit the structured schema (not a bare traceback) so the wrapper/agent
+        # can parse a setup error the same way as a compile/eval failure.
+        print("COMPILED: False")
+        print("CORRECT: False")
+        print(f"BACKEND: {args.backend or 'ttnn'} (n/a)")
+        print("PCC: -1\nRUNTIME: -1\nREF_RUNTIME: -1\nSPEEDUP: -1")
+        print(f"ERROR: {msg}")
+        sys.exit(1)
+
+    try:
+        ref_src = read_file(args.ref)
+    except OSError as e:
+        _fail(f"cannot read --ref {args.ref}: {e}")
+    try:
+        sol_src = read_file(args.solution)
+    except OSError as e:
+        _fail(f"cannot read --solution {args.solution}: {e}")
 
     if args.backend is None:
         args.backend = _auto_detect_backend(sol_src)
@@ -1167,7 +1285,10 @@ def main():
     get_inputs_override = None
     get_init_inputs_override = None
     if args.inputs:
-        get_inputs_override, get_init_inputs_override = load_inputs_module(args.inputs)
+        try:
+            get_inputs_override, get_init_inputs_override = load_inputs_module(args.inputs)
+        except (OSError, ValueError) as e:
+            _fail(f"cannot load --inputs {args.inputs}: {e}")
         if args.verbose:
             print(f"[Inputs] Loaded get_inputs from {args.inputs}")
             if get_init_inputs_override is not None:

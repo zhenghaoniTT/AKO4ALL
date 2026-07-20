@@ -15,10 +15,10 @@ Distilled from the [tt-metal tech reports](https://github.com/tenstorrent/tt-met
 | | Tensix (compute)† | L1/core | DRAM | DRAM BW | Peak matmul (by dtype)‡ | Clock |
 |---|---|---|---|---|---|---|
 | Wormhole (n150) | ~64 (8×8) | ~1.5 MB | 12 GB, 12 banks | 288 GB/s (336 @14Gbps) | ~50 (bf16) / ~190 (bfp4) TFLOPS | 1.0 GHz |
-| Blackhole (p150) | ~120 (up to 13×10) | ~1.5 MB | 32 GB, 8 banks | ~512 GB/s | 332 (bf16) / 664 (bfp8) TFLOPS | 1.35 GHz |
+| Blackhole (p150) | ~120 (up to 13×10) | ~1.5 MB | 32 GB, 8 banks | ~512 GB/s | ~168 (bf16) / 664 (bfp8, peak) TFLOPS | 1.35 GHz |
 
 † Core counts are nominal/marketed; the **usable** Tensix grid varies with harvesting — query `device.compute_with_storage_grid_size()` at runtime rather than hard-coding it.
-‡ Matmul peak depends on data format **and** math fidelity (bf16 « bfp8 « bfp4 / LoFi). Compare achieved TFLOPS against the peak *for the dtype you actually run* — the high aggregate figures (e.g. WH ~190) are bfp4/LoFi, not bf16.
+‡ Matmul peak depends on data format **and** math fidelity (bf16 « bfp8 « bfp4 / LoFi). Compare achieved TFLOPS against the *achieved* peak *for the dtype you actually run* — the high aggregate figures (e.g. WH ~190) are bfp4/LoFi, not bf16. Blackhole's marketing headline (332 FP16 / 664 BLOCKFP8) is ~2× the achievable **bf16** matmul (~168, GEMM_FLOPS); use the achieved bf16 number for a bf16 compute-bound stop check, not 332.
 
 Grayskull is **discontinued** — do not target it.
 Refs: [Blackhole](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports/Blackhole), [matrix_engine](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports/matrix_engine), [GEMM_FLOPS](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports/GEMM_FLOPS), [Saturating_DRAM_bandwidth](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports/Saturating_DRAM_bandwidth).
@@ -39,7 +39,7 @@ Ref: [op_kernel_dev/accuracy_tips](https://github.com/tenstorrent/tt-metal/tree/
 Tracy-based, built into tt-metal.
 
 - **Build** with the profiler — Tracy is **on by default**, so a plain `./build_metal.sh` includes it (`--disable-profiler` turns it off); tools land in `build/tools/profiler/bin/`. **Runtime gate:** `export TT_METAL_DEVICE_PROFILER=1` (off by default — readback adds overhead).
-- **Per-op device latency:** `cd $TT_METAL_HOME && ./tools/tracy/profile_this.py -n <name> -c "pytest <test>"` (or `python -m tracy -m pytest <test>`) → `generated/profiler/reports/ops_perf_results_<ts>.csv`. Key columns (ns): `DEVICE KERNEL DURATION` (primary), `DEVICE FW DURATION` (fixed overhead), `HOST DURATION` (dispatch), per-RISC `DEVICE {BRISC,NCRISC,TRISC0/1/2} KERNEL DURATION`, `DEVICE COMPUTE CB WAIT FRONT` (compute starved) / `CB RESERVE BACK` (compute back-pressured).
+- **Per-op device latency:** `cd $TT_METAL_HOME && ./tools/tracy/profile_this.py -n <name> -c "pytest <test>"` (or `python -m tracy -r -m pytest <test>` — `-r` is required to emit the op-report CSV) → `generated/profiler/reports/ops_perf_results_<ts>.csv`. Key columns (ns): `DEVICE KERNEL DURATION` (primary), `DEVICE FW DURATION` (fixed overhead), `HOST DURATION` (dispatch), per-RISC `DEVICE {BRISC,NCRISC,TRISC0/1/2} KERNEL DURATION`, `DEVICE COMPUTE CB WAIT FRONT` (compute starved) / `CB RESERVE BACK` (compute back-pressured).
 - **Bottleneck metrics** (the `ncu --metrics` equivalent): run under `python -m tracy --profiler-capture-perf-counters=all` (groups: `fpu,pack,unpack,l1_0,instrn`; `all` for everything). Triage: **MATH/FPU/SFPU Util %** (compute-bound?), **Thread 0/1/2 Stall Rate %** (T0=unpack starvation, T1=math, T2=pack), **NOC vs Compute Balance %** (>60% NOC-bound), **Compute-to-Unpack Ratio** (<20% memory-bound), **L1 Total Bandwidth Util %**, **Fidelity Stall Rate** (HiFi cost).
 - **Timeline:** Tracy WASM web viewer (auto-starts on `python -m tracy`, HTTP 8080) or Tracy GUI (port 8086).
 - **Do not** enable DPRINT / Watcher while profiling or timing — they perturb latency and conflict with `TT_METAL_DEVICE_PROFILER`.
@@ -73,13 +73,13 @@ ttnn.close_device(device)
 ## Physical floors (for the "when to stop" decision)
 
 - **Memory-bound:** achieved GB/s = bytes moved / kernel time; near the DRAM ceiling (WH 288–336, BH ~512 GB/s) → done. Well-tuned readers hit >90%.
-- **Compute-bound:** achieved TFLOPS = 2·M·N·K / time; near peak **for the dtype in use** (WH ~50 bf16 / ~190 bfp4; BH 332 bf16 / 664 bfp8) → done. Per-op utilization = ideal_cycles / actual_cycles.
+- **Compute-bound:** achieved TFLOPS = 2·M·N·K / time; near the *achieved* peak **for the dtype in use** (WH ~50 bf16 / ~190 bfp4; BH ~168 bf16, higher at bfp8 — the 332/664 headlines are marketing FP16/BLOCKFP8) → done. Per-op utilization = ideal_cycles / actual_cycles.
 - **L1-resident** with no DRAM spills, or **dispatch overhead** dominating a small op after Metal Trace + multi-CQ, are also floors.
 
 ## Two kernel layers
 
 - **TT-NN (ttnn)** — PyTorch-like Python op library. `ttnn.open_device`, `ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=DEVICE)`, `ttnn.matmul`/`ttnn.add`/…, `ttnn.to_torch`. Optimize by op choice, dtype, layout, memory config / sharding, core grid, math fidelity, trace. Ref: [ttnn](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports/ttnn).
-- **tt-metal** — low-level C++ Tensix kernels. Host builds a `Program`, allocates DRAM/L1 buffers + circular buffers, `CreateKernel(program, "reader.cpp"/"compute.cpp"/"writer.cpp", core, {Reader,Compute,Writer}Config{...})`, `SetRuntimeArgs`, `EnqueueProgram`/`Finish`. Kernel side: `noc_async_read/write` + barriers (dataflow); `cb_wait_front`/`cb_reserve_back`/`cb_push_back`/`cb_pop_front`, `matmul_tiles`, SFPU `*_tile` ops, `tile_regs_acquire/commit/wait/release`, `pack_tile` (compute). Ref: [prog_examples](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports/prog_examples), [ttnn_operators](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports/ttnn_operators).
+- **tt-metal** — low-level C++ Tensix kernels. Host builds a `Program`, allocates DRAM/L1 buffers + circular buffers, `CreateKernel(program, "reader.cpp"/"compute.cpp"/"writer.cpp", core, {Reader,Compute,Writer}Config{...})`, `SetRuntimeArgs`, `EnqueueProgram`/`Finish`. **From Python** (the host API above is C++-only) drive kernels via `ttnn.generic_op` with `ProgramDescriptor`/`CBDescriptor`/`KernelDescriptor`, the PyKernel API, or a compiled pybind / `torch.utils.cpp_extension` module. Kernel side: `noc_async_read/write` + barriers (dataflow); `cb_wait_front`/`cb_reserve_back`/`cb_push_back`/`cb_pop_front`, `matmul_tiles`, SFPU `*_tile` ops, `tile_regs_acquire/commit/wait/release`, `pack_tile` (compute). Ref: [prog_examples](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports/prog_examples), [ttnn_operators](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports/ttnn_operators).
 
 ## Debugging
 
