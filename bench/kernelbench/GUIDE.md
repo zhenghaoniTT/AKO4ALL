@@ -34,7 +34,7 @@ RUNTIME is the solution's end-to-end device latency (including the host↔device
 These are typical paths, not rules.
 
 - **TT-NN op** — the solution is a Python file whose `forward` calls `ttnn` ops. Reference is the equivalent PyTorch op. Use the ref directly as `--ref`; the solution as `--solution`.
-- **tt-metal Tensix kernel** — the solution is a Python host wrapper that builds/launches C++ kernels (reader / compute / writer `.cpp`, circular buffers) via `ttnn` / `tt_metal`. Keep the `.cpp` kernel files **next to** the solution `.py` (the bench loads the solution from a temp file in its own directory so `os.path.dirname(__file__)`-relative kernel paths still resolve).
+- **tt-metal Tensix kernel** — the solution is a Python `forward` that drives C++ kernels (reader / compute / writer `.cpp`, circular buffers). The raw Metalium host API (`CreateKernel`/`Program`) is C++-only, so from Python use `ttnn.generic_op` with `ProgramDescriptor`/`CBDescriptor`/`KernelDescriptor`, the PyKernel API, or a compiled pybind / `torch.utils.cpp_extension` module that exposes the program. Keep the `.cpp` kernel files **next to** the solution `.py` (the bench loads the solution from a temp file in its own directory so `os.path.dirname(__file__)`-relative kernel paths still resolve).
 - **Kernel + separate input data** — user provides a kernel plus data in a non-Python format (`.npz`, `.pt`, `.bin`, shape lists). Keep the reference in `--ref`, then write `source/inputs.py` whose `get_inputs()` loads the data (`np.load`, `torch.load`, custom parser) and returns torch tensors. Pass it via `--inputs`.
 - **Kernel referenced by external path** — `--ref` / `--inputs` accept arbitrary paths (e.g. into a model repo); no need to copy files into `source/`.
 
@@ -122,11 +122,11 @@ Exit code: `0` = correct, `1` = incorrect or failed.
 
 - The solution file must contain `class Model(nn.Module)` with a `forward()` matching the reference's signature. It is renamed to `ModelNew` transparently — **do not** rename it yourself.
 - `forward` takes torch CPU tensors and returns a torch tensor (or `ttnn.Tensor`); it does the `ttnn.from_torch → ops → ttnn.to_torch` round-trip internally, using the injected `DEVICE` global.
-- Do not include `get_inputs()` / `get_init_inputs()` in the solution. The bench strips the solution's module-level tail (variables and functions after the last class) as an anti-cheat boundary — any such definitions are silently dropped, so the solution cannot influence which inputs it is tested against.
+- Do not include `get_inputs()` / `get_init_inputs()` in the solution. The bench removes any top-level `get_inputs` / `get_init_inputs` definitions as an anti-cheat boundary (test inputs come from the reference / `--inputs`, never the solution) — but it **keeps** other post-class helper functions and constants, so you may define those freely.
 
 ## Correctness — PCC, not tight allclose
 
-TT kernels run in low-precision formats (bfloat16 ≈ 8 mantissa bits; bfloat8_b / bfloat4_b fewer), so element-wise agreement with an fp32 golden to fp32-grade tolerance (`rtol=1e-5, atol=1e-8`) is physically impossible even for a *correct* kernel. The TT-standard metric is PCC (Pearson Correlation Coefficient), which measures whole-tensor correlation.
+TT kernels run in low-precision formats (bfloat16 has 7 mantissa bits ≈ 2–3 decimal digits; bfloat8_b / bfloat4_b fewer), so element-wise agreement with an fp32 golden to fp32-grade tolerance (`rtol=1e-5, atol=1e-8`) is physically impossible even for a *correct* kernel. The TT-standard metric is PCC (Pearson Correlation Coefficient), which measures whole-tensor correlation.
 
 | Precision of the kernel | Typical PCC threshold |
 |-------------------------|-----------------------|

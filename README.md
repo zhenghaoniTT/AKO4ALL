@@ -132,7 +132,7 @@ Speedups on Tenstorrent depend heavily on the operator, the shapes, the data for
 What the loop reports, and how it decides it is done:
 
 - **Per iteration:** the solution's own `RUNTIME` (lower is better) is the ranking signal; `PCC` gates correctness.
-- **Physical floors** (a legitimate stop): near the DRAM bandwidth ceiling for memory-bound kernels (Wormhole ≈ 288–336 GB/s, Blackhole ≈ 512 GB/s), or near the matrix-engine peak **for the dtype in use** for compute-bound kernels (data-format/fidelity dependent — e.g. Wormhole ≈ 50 TFLOPS bf16 / ≈ 190 bfp4, Blackhole ≈ 332 bf16 / 664 bfp8). Core counts vary with harvesting — query `device.compute_with_storage_grid_size()` at runtime. See [`knowledge/tenstorrent.md`](knowledge/tenstorrent.md).
+- **Physical floors** (a legitimate stop): near the DRAM bandwidth ceiling for memory-bound kernels (Wormhole ≈ 288–336 GB/s, Blackhole ≈ 512 GB/s), or near the *achieved* matrix-engine peak **for the dtype in use** for compute-bound kernels (data-format/fidelity dependent — e.g. Wormhole ≈ 50 TFLOPS bf16 / ≈ 190 bfp4, Blackhole ≈ 168 bf16; the 332/664 marketing headlines are FP16/BLOCKFP8, ~2× the achievable bf16). Core counts vary with harvesting — query `device.compute_with_storage_grid_size()` at runtime. See [`knowledge/tenstorrent.md`](knowledge/tenstorrent.md).
 
 The original NVIDIA/CUDA study and its FlashInfer-expert results live in the [upstream AKO project](https://tongminglaic.github.io/AKO).
 
