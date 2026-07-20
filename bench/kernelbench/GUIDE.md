@@ -45,7 +45,7 @@ The bench calls `get_inputs()` once per correctness trial (5 by default) and aga
 ### Bench command
 
 ```
-python bench/kernelbench/bench.py --ref <ref-path>.py --solution solution/<kernel>.py [--inputs <inputs-path>.py] --pcc 0.99 --verbose
+python3 bench/kernelbench/bench.py --ref <ref-path>.py --solution solution/<kernel>.py [--inputs <inputs-path>.py] --pcc 0.99 --verbose
 ```
 
 If the file passed to `--inputs` also defines `get_init_inputs()`, it overrides the ref's version too. The solution file keeps `class Model` — the bench transparently renames it to `class ModelNew` before evaluation.
@@ -56,9 +56,9 @@ The reference is re-run for every correctness trial *and* re-timed for the speed
 
 ```
 # signal (fast): rank by RUNTIME, no reference timing
-python bench/kernelbench/bench.py --ref <ref>.py --solution solution/<k>.py --no-ref --num-perf-trials 20
+python3 bench/kernelbench/bench.py --ref <ref>.py --solution solution/<k>.py --no-ref --num-perf-trials 20
 # verdict (before declaring a winner): full run, real SPEEDUP + full PCC re-check
-python bench/kernelbench/bench.py --ref <ref>.py --solution solution/<k>.py
+python3 bench/kernelbench/bench.py --ref <ref>.py --solution solution/<k>.py
 ```
 
 `--no-ref` leaves `REF_RUNTIME`/`SPEEDUP` at -1; correctness still runs `--num-correct-trials` PCC trials, so trim that too (keep it ≥1) if the reference is the bottleneck. Never swap the comparison target to speed up the bench — only reduce how often the reference is paid for.
@@ -99,6 +99,7 @@ Exit code: `0` = correct, `1` = incorrect or failed.
 | `--solution` | (required) | Path to optimized kernel (defines `class Model`, runs on the TT device) |
 | `--inputs` | (none) | Optional file defining `get_inputs()` (required) and `get_init_inputs()` (optional); overrides definitions in `--ref` |
 | `--pcc` | `0.99` | PCC correctness threshold. Use `0.999` / `0.9999` for fp32/bf16-strict ops |
+| `--rel-tol` | `0.1` | Relative-L2 magnitude tolerance, checked **alongside** PCC. Catches scale/bias errors PCC misses (e.g. output×2) while tolerating bf16/bfloat8_b noise; loosen for bfloat4_b |
 | `--backend` | auto-detected | `ttnn`, `tt-metal` (auto-detected from solution source; pass explicitly to override). Informational — both load the same way |
 | `--device-id` | `0` | Tenstorrent device id to open |
 | `--num-correct-trials` | `5` | Number of PCC correctness trials |
@@ -133,7 +134,7 @@ TT kernels run in low-precision formats (bfloat16 ≈ 8 mantissa bits; bfloat8_b
 | bfloat16 (default) | 0.99 – 0.999 |
 | bfloat8_b / bfloat4_b (aggressive) | 0.99 (or looser, if the user allows) |
 
-The bench's `comp_pcc` masks NaN/Inf to zero, handles constant tensors by comparing their max value, and returns 1.0 for identical tensors. **PCC blind spot:** a global scale/bias (e.g. output ×2) can still yield PCC ≈ 1 — if an op is suspiciously "correct", sanity-check magnitudes separately.
+The bench's `comp_pcc` masks each tensor's own NaN/Inf to zero, handles constant tensors by comparing their value with a loose tolerance, and returns 1.0 for identical tensors. **PCC blind spot:** a global scale/bias (e.g. output ×2) can still yield PCC ≈ 1 — so correctness is gated on PCC **and** a relative-L2 magnitude check (`--rel-tol`, default 0.1), which rejects a 2× scale (~1.0 error) while tolerating bf16/bfloat8_b rounding (a few %). Both must pass for `CORRECT: True`.
 
 ## Timing
 

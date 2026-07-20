@@ -53,7 +53,7 @@ The reference is a plain PyTorch `class Model` run on the **CPU** as the numeric
 A kernel and at least one set of test inputs are required. Everything else is optional.
 
 - **Kernel** (required) — The kernel to optimize. A TT-NN solution (a Python file whose `forward` runs `ttnn` ops) or a tt-metal solution (a Python host wrapper launching C++ Tensix kernels).
-- **Reference implementation** (optional) — A PyTorch `class Model`, used as the correctness golden (run on CPU). If absent, the original kernel is used.
+- **Reference implementation** — A plain-PyTorch `class Model` the evaluator runs on **CPU** as the fp32 golden. Required for the built-in evaluator; a ttnn / tt-metal kernel can't double as the CPU golden, so express the intended computation in PyTorch (a plain-PyTorch kernel can be its own reference).
 - **Inputs** (at least one set required) — In any form: hardcoded in the kernel/reference, a `get_inputs()` function, or raw data files (`.npz`, `.pt`, `.bin`, shape lists, etc.) the agent wires up itself.
 - **Benchmark script** (optional) — Your own benchmark script; the agent reads it to figure out how to run it. If none is provided, the built-in Tenstorrent evaluator is used automatically.
 - **Knowledge** (optional) — Reference materials: algorithm descriptions, papers, design docs. The skill ships `knowledge/tenstorrent.md`, a TT stack cheat-sheet the agent reads.
@@ -132,7 +132,7 @@ Speedups on Tenstorrent depend heavily on the operator, the shapes, the data for
 What the loop reports, and how it decides it is done:
 
 - **Per iteration:** the solution's own `RUNTIME` (lower is better) is the ranking signal; `PCC` gates correctness.
-- **Physical floors** (a legitimate stop): near the DRAM bandwidth ceiling for memory-bound kernels (Wormhole ≈ 288–336 GB/s, Blackhole ≈ 512 GB/s), or near matrix-engine peak for compute-bound kernels (Wormhole ≈ 190 TFLOPS, Blackhole ≈ 332 TFLOPS bf16 / 664 bfp8). See [`knowledge/tenstorrent.md`](knowledge/tenstorrent.md).
+- **Physical floors** (a legitimate stop): near the DRAM bandwidth ceiling for memory-bound kernels (Wormhole ≈ 288–336 GB/s, Blackhole ≈ 512 GB/s), or near the matrix-engine peak **for the dtype in use** for compute-bound kernels (data-format/fidelity dependent — e.g. Wormhole ≈ 50 TFLOPS bf16 / ≈ 190 bfp4, Blackhole ≈ 332 bf16 / 664 bfp8). Core counts vary with harvesting — query `device.compute_with_storage_grid_size()` at runtime. See [`knowledge/tenstorrent.md`](knowledge/tenstorrent.md).
 
 The original NVIDIA/CUDA study and its FlashInfer-expert results live in the [upstream AKO project](https://tongminglaic.github.io/AKO).
 
@@ -201,7 +201,7 @@ Point the skill at a kernel and a PyTorch reference; it wires up the built-in ev
    export TT_METAL_HOME=/path/to/tt-metal
    export PYTHONPATH="$TT_METAL_HOME:$PYTHONPATH"
    export ARCH_NAME=wormhole_b0
-   python -c "import ttnn; d=ttnn.open_device(device_id=0); ttnn.close_device(d); print('ok')"
+   python3 -c "import ttnn; d=ttnn.open_device(device_id=0); ttnn.close_device(d); print('ok')"
    ```
 
 2. Open Claude Code in a directory with your kernel + reference and give it a prompt:

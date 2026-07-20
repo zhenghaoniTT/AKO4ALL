@@ -57,8 +57,10 @@ SOFTWARE.
 """
 
 import argparse
+import copy
 import importlib
 import importlib.util
+import io
 import math
 import os
 import re
@@ -66,9 +68,15 @@ import statistics
 import sys
 import tempfile
 import time
+import tokenize
 import traceback
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+# SPEEDUP compares the TT solution to a CPU reference, so large values are often
+# legitimate — but an implausibly high ratio is worth a second look for reward
+# hacking (a solution that doesn't really run on device). Informational only.
+EXCESSIVE_SPEEDUP_THRESHOLD = 100.0
 
 import torch
 import torch.nn as nn
@@ -167,6 +175,28 @@ def comp_pcc(golden: torch.Tensor, calculated: torch.Tensor, pcc: float = 0.99):
     if math.isnan(cc):
         return False, 0.0
     return cc >= pcc, float(cc)
+
+
+def relative_l2_error(golden: torch.Tensor, calculated: torch.Tensor) -> float:
+    """Whole-tensor relative L2 error ``||golden - calc|| / ||golden||``.
+
+    A loose magnitude guard meant to run ALONGSIDE PCC, not instead of it. PCC
+    is invariant to a global scale/bias — a kernel returning ``2*output`` still
+    scores PCC ≈ 1 — so PCC alone cannot reject magnitude errors. Relative L2
+    flags them (a 2× scale → ≈ 1.0) while staying small for bf16 / bfloat8_b
+    rounding noise (typically a few %), so the two together catch a broad class
+    of wrong-but-correlated outputs.
+    """
+    g = torch.nan_to_num(golden.detach().flatten().to(torch.float32))
+    c = torch.nan_to_num(calculated.detach().flatten().to(torch.float32))
+    if g.shape != c.shape:
+        return float("inf")
+    denom = torch.linalg.vector_norm(g).item()
+    num = torch.linalg.vector_norm(g - c).item()
+    if denom == 0.0:
+        # golden is all-zero: fall back to the absolute error magnitude.
+        return num
+    return num / denom
 
 
 ###############################################################################
@@ -367,14 +397,17 @@ def run_and_check_correctness(
     metadata: dict,
     num_correct_trials: int,
     pcc_threshold: float,
+    rel_tol: float = 0.1,
     verbose: bool = False,
     seed: int = 42,
 ) -> KernelExecResult:
     """Run reference (CPU) and solution (TT) over fresh-input trials, comparing
-    with PCC. The reference is the golden; PCC on fresh random inputs is the
-    anti-cheat (a constant/precomputed output fails)."""
+    with PCC plus a relative-L2 magnitude guard. The reference is the golden; the
+    checks on fresh random inputs are the anti-cheat (a constant / precomputed /
+    scaled output fails)."""
     pass_count = 0
     min_pcc = 1.0
+    max_rel_err = 0.0
 
     torch.manual_seed(seed)
     trial_seeds = [
@@ -387,12 +420,17 @@ def run_and_check_correctness(
             if verbose:
                 print(f"[Eval] Generating random input with seed {trial_seed}")
 
+            # Generate the inputs ONCE, then deep-copy for the solution. Calling
+            # get_inputs() a second time would diverge whenever it uses numpy /
+            # random / a counter (only torch's RNG is reset here), scoring the
+            # reference and solution on different data. The copy also stops the
+            # solution from mutating the reference's tensors in place.
             set_seed(trial_seed)
             ref_inputs = get_inputs_fn()
-            # Reference runs on CPU as the fp32 golden. Give the solution its own
-            # fresh copies so it cannot mutate the reference's inputs.
-            set_seed(trial_seed)
-            sol_inputs = get_inputs_fn()
+            sol_inputs = [
+                x.clone() if isinstance(x, torch.Tensor) else copy.deepcopy(x)
+                for x in ref_inputs
+            ]
 
             ref_output = original_model_instance(*ref_inputs)
 
@@ -419,19 +457,31 @@ def run_and_check_correctness(
                         )
                     return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
 
-                passing, pcc_val = comp_pcc(ref_cpu, sol_cpu, pcc_threshold)
+                # Correctness = PCC gate AND magnitude gate. PCC alone is blind
+                # to a global scale/bias (output×2 scores PCC≈1); relative L2
+                # catches that while tolerating bf16/bfloat8_b rounding noise.
+                passing_pcc, pcc_val = comp_pcc(ref_cpu, sol_cpu, pcc_threshold)
+                rel_err = relative_l2_error(ref_cpu, sol_cpu)
                 min_pcc = min(min_pcc, pcc_val)
+                max_rel_err = max(max_rel_err, rel_err)
+                passing = passing_pcc and rel_err <= rel_tol
                 if passing:
                     pass_count += 1
                     if verbose:
-                        print(f"[PASS] trial {trial}: PCC {pcc_val:.6f} >= {pcc_threshold}")
+                        print(
+                            f"[PASS] trial {trial}: PCC {pcc_val:.6f} >= {pcc_threshold}, "
+                            f"rel_err {rel_err:.4f} <= {rel_tol}"
+                        )
                 else:
+                    reasons = []
+                    if not passing_pcc:
+                        reasons.append(f"PCC {pcc_val:.6f} < {pcc_threshold}")
+                    if rel_err > rel_tol:
+                        reasons.append(f"rel_err {rel_err:.4f} > {rel_tol}")
                     metadata.setdefault("pcc_values", []).append(f"{pcc_val:.6f}")
-                    metadata["correctness_issue"] = (
-                        f"PCC {pcc_val:.6f} below threshold {pcc_threshold}"
-                    )
+                    metadata["correctness_issue"] = "; ".join(reasons)
                     if verbose:
-                        print(f"[FAIL] trial {trial}: PCC {pcc_val:.6f} < {pcc_threshold}")
+                        print(f"[FAIL] trial {trial}: {'; '.join(reasons)}")
 
             except Exception as e:
                 print("[Error] Exception during correctness check")
@@ -446,6 +496,7 @@ def run_and_check_correctness(
 
     metadata["correctness_trials"] = f"({pass_count} / {num_correct_trials})"
     metadata["min_pcc"] = f"{min_pcc:.6f}"
+    metadata["max_rel_err"] = f"{max_rel_err:.6f}"
     correct = pass_count == num_correct_trials
     return KernelExecResult(
         compiled=True, correctness=correct, pcc=min_pcc, metadata=metadata
@@ -460,6 +511,7 @@ def eval_kernel_against_ref(
     num_perf_trials: int = 100,
     measure_performance: bool = True,
     pcc_threshold: float = 0.99,
+    rel_tol: float = 0.1,
     verbose: bool = False,
     device_id: int = 0,
     backend: str = "ttnn",
@@ -523,9 +575,13 @@ def eval_kernel_against_ref(
     temp_path = None
     try:
         # --- Load reference (CPU golden) ---
+        # The reference is a plain PyTorch model evaluated on the CPU — the fp32
+        # golden. Deliberately do NOT inject DEVICE here: the reference must not
+        # touch the TT device (that keeps its timing sync-free and the contract
+        # unambiguous — only the solution runs on device).
         if verbose:
             print("[Eval] Loading reference model (CPU golden)")
-        ref_context: dict = {"DEVICE": device}
+        ref_context: dict = {}
         loaded = load_original_model_and_inputs(
             original_model_src, ref_context, source_path=ref_path
         )
@@ -608,6 +664,7 @@ def eval_kernel_against_ref(
                 metadata=metadata,
                 num_correct_trials=num_correct_trials,
                 pcc_threshold=pcc_threshold,
+                rel_tol=rel_tol,
                 verbose=verbose,
                 seed=seed_num,
             )
@@ -685,19 +742,38 @@ def read_file(path: str) -> str:
 
 
 def rename_model_to_modelnew(src: str) -> str:
-    """Rename the solution's `Model` class to `ModelNew`.
+    """Rename the solution's `Model` class (and its references) to `ModelNew`.
 
-    Renames every standalone `Model` identifier — the class def, `super(Model,
+    Rewrites only NAME tokens equal to `Model` — the class def, `super(Model,
     self)`, and in-body references like `isinstance(x, Model)` or
     `Model.some_staticmethod(...)`. Renaming only the class def would leave those
-    references bound to a name that no longer exists (NameError at eval). `\\bModel\\b`
-    does not match inside `ModelNew` / `MyModel` / `ModelBuilder` (word boundaries)
-    or the lowercase `model`.
+    references bound to a name that no longer exists (NameError at eval).
+
+    Because it operates on tokens, it leaves strings, comments, and substrings
+    (`MyModel`, `model_kernel.cpp`, a registered op name containing "Model")
+    untouched — a blanket regex would corrupt those. Falls back to a
+    word-boundary regex only if the source cannot be tokenized.
     """
     if re.search(r"\bclass\s+ModelNew\b", src):
         return src  # already has ModelNew
 
-    return re.sub(r"\bModel\b", "ModelNew", src)
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(src).readline))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return re.sub(r"\bModel\b", "ModelNew", src)
+
+    lines = src.splitlines(keepends=True)
+    edits = []  # (line_index, col_start, col_end) of each `Model` NAME token
+    for tok in tokens:
+        if tok.type == tokenize.NAME and tok.string == "Model":
+            (srow, scol), (erow, ecol) = tok.start, tok.end
+            if srow == erow:  # an identifier never spans lines
+                edits.append((srow - 1, scol, ecol))
+    # Apply right-to-left so earlier column offsets on a line stay valid.
+    for line_idx, scol, ecol in sorted(edits, reverse=True):
+        line = lines[line_idx]
+        lines[line_idx] = line[:scol] + "ModelNew" + line[ecol:]
+    return "".join(lines)
 
 
 def _find_tail_section(src: str) -> int:
@@ -872,7 +948,8 @@ def get_init_inputs():
     a = torch.randn(1024)
     passing, val = comp_pcc(a, a.clone(), 0.99)
     assert passing and abs(val - 1.0) < 1e-6, f"identical tensors must give PCC 1.0, got {val}"
-    # A global scale is a documented PCC blind spot: still ~1.0.
+    # A global scale is a PCC blind spot: PCC alone still ~1.0 (the magnitude
+    # guard below is what actually catches it).
     passing, val = comp_pcc(a, a * 2.0, 0.99)
     assert passing and val > 0.99, f"scaled tensor should still correlate, got {val}"
     # Uncorrelated noise (constant-vs-noise style garbage) should fail.
@@ -886,6 +963,18 @@ def get_init_inputs():
     passing, val = comp_pcc(a, torch.randn(512), 0.99)
     assert not passing, "shape mismatch must fail"
     print("Self-test PASSED: PCC metric.")
+
+    # --- Relative-L2 magnitude guard (catches what PCC misses) ---
+    assert relative_l2_error(a, a.clone()) < 1e-6, "identical tensors: zero rel error"
+    # output*2 sails through PCC but the magnitude guard rejects it (~1.0 >> 0.1).
+    assert relative_l2_error(a, a * 2.0) > 0.5, "a 2x scale must be a large rel error"
+    # bf16 round-trip stays well under a 0.1 gate.
+    assert relative_l2_error(a, a.to(torch.bfloat16).to(torch.float32)) < 0.05, \
+        "bf16 round-trip rel error must stay small"
+    # all-zero golden vs nonzero solution -> nonzero (absolute) error.
+    assert relative_l2_error(torch.zeros(64), torch.full((64,), 0.5)) > 0.0, \
+        "all-zero golden vs nonzero must be flagged"
+    print("Self-test PASSED: relative-L2 magnitude guard.")
 
     # NaN in the solution where the golden is finite must FAIL — per-tensor
     # masking, not a union that would zero the golden there and hide it.
@@ -917,8 +1006,28 @@ class Model(nn.Module):
     r = prepare_solution_source(sol_ref)
     assert "isinstance(self, ModelNew)" in r, "in-body isinstance ref must be renamed"
     assert "ModelNew.scale(x)" in r, "in-body staticmethod ref must be renamed"
-    assert not re.search(r"\bModel\b", r), "no bare Model may survive the rename"
+    assert not re.search(r"\bclass Model\b", r), "class def must be renamed"
     print("Self-test PASSED: in-body Model references renamed.")
+
+    # Token-based rename must NOT touch `Model` inside strings / comments /
+    # substrings (a blanket regex would corrupt op names and kernel paths).
+    sol_str = '''import torch.nn as nn
+
+class Model(nn.Module):
+    # Model note: keep this comment's word intact
+    name = "Model op v1"
+    path = "kernels/Model_reader.cpp"
+
+    def forward(self, x):
+        return MyModel_helper(x)
+'''
+    rs = rename_model_to_modelnew(sol_str)
+    assert "class ModelNew(" in rs, "class def must be renamed"
+    assert '"Model op v1"' in rs, "string literal 'Model' must be untouched"
+    assert "kernels/Model_reader.cpp" in rs, "path substring must be untouched"
+    assert "# Model note" in rs, "comment 'Model' must be untouched"
+    assert "MyModel_helper" in rs, "unrelated identifier must be untouched"
+    print("Self-test PASSED: token rename leaves strings/comments/substrings intact.")
 
     # --- load_inputs_module ---
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
@@ -980,6 +1089,14 @@ def main():
         default=0.99,
         help="PCC (Pearson Correlation Coefficient) threshold for correctness "
              "(default: 0.99). Use 0.999 / 0.9999 for stricter fp32/bf16 checks.",
+    )
+    parser.add_argument(
+        "--rel-tol",
+        type=float,
+        default=0.1,
+        help="Relative-L2 magnitude tolerance, checked alongside PCC (default: "
+             "0.1). Catches scale/bias errors PCC is blind to (e.g. output×2) "
+             "while tolerating bf16/bfloat8_b noise. Loosen for bfloat4_b.",
     )
     parser.add_argument(
         "--backend",
@@ -1076,6 +1193,7 @@ def main():
         measure_performance=True,
         measure_reference=not args.no_ref,
         pcc_threshold=args.pcc,
+        rel_tol=args.rel_tol,
         verbose=args.verbose,
         device_id=args.device_id,
         backend=args.backend,
@@ -1107,6 +1225,16 @@ def main():
     print(f"RUNTIME: {runtime_ms:.4f}" if runtime_ms > 0 else "RUNTIME: -1")
     print(f"REF_RUNTIME: {ref_runtime_ms:.4f}" if ref_runtime_ms > 0 else "REF_RUNTIME: -1")
     print(f"SPEEDUP: {speedup:.4f}x" if speedup > 0 else "SPEEDUP: -1")
+
+    if speedup > EXCESSIVE_SPEEDUP_THRESHOLD:
+        print(
+            f"[WARNING] SPEEDUP {speedup:.1f}x exceeds {EXCESSIVE_SPEEDUP_THRESHOLD:.0f}x. "
+            "SPEEDUP is measured against a CPU reference, so a large value can be "
+            "legitimate for a real TT kernel — but double-check the solution actually "
+            "runs on the device and isn't returning trivial/precomputed output "
+            "(the fresh-input PCC + magnitude checks guard against this, but verify).",
+            file=sys.stderr,
+        )
 
     if args.verbose:
         print()
