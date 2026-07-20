@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 """
-Self-contained KernelBench benchmark for AKO4ALL.
+Self-contained Tenstorrent kernel benchmark for AKO4ALL.
 
-Evaluates an optimized kernel (solution) against a reference kernel.
-Inlines core logic from KernelBench's eval.py and timing.py so no external
-KernelBench dependency is needed.
+Evaluates an optimized Tenstorrent kernel (solution) against a reference
+implementation. The reference is a plain PyTorch `class Model` that runs on the
+**CPU** and serves as the numerical golden; the solution runs on a Tenstorrent
+device (TT-NN ops and/or tt-metal Tensix kernels) and is compared with the
+Pearson Correlation Coefficient (PCC) — the standard TT correctness metric —
+rather than a tight `torch.allclose`, because bfloat16 / bfloat8_b outputs
+diverge element-wise from an fp32 golden while staying highly correlated.
+
+Timing is host wall-clock around the solution's `forward`, bracketed by
+`ttnn.synchronize_device(device)` (TT dispatch is asynchronous, so without the
+sync you would time only host enqueue). The first run is discarded because it
+JIT-compiles the kernels and populates the program cache; steady-state numbers
+come from the cached runs. For per-kernel device timing and bottleneck metrics
+use the tt-metal device profiler (Tracy) separately — see GUIDE.md.
 
 Usage:
     python bench/kernelbench/bench.py --ref <ref-path> --solution solution/<kernel> [options]
@@ -12,9 +23,14 @@ Usage:
 Output (structured, one per line):
     COMPILED: True/False
     CORRECT: True/False
-    RUNTIME: <ms>
-    REF_RUNTIME: <ms>
-    SPEEDUP: <x>
+    BACKEND: ttnn|tt-metal (auto|explicit)
+    PCC: <value>
+    RUNTIME: <ms>          # solution, on the TT device (end-to-end incl. transfer)
+    REF_RUNTIME: <ms>      # reference, on CPU (torch)
+    SPEEDUP: <x>           # REF_RUNTIME / RUNTIME
+
+The KernelBench-format contract (class Model + get_inputs / get_init_inputs) and
+the anti-cheat source transforms are inherited from KernelBench.
 
 Portions of this file are derived from KernelBench
 (https://github.com/ScalingIntelligence/KernelBench).
@@ -43,6 +59,7 @@ SOFTWARE.
 import argparse
 import importlib
 import importlib.util
+import math
 import os
 import re
 import statistics
@@ -50,159 +67,170 @@ import sys
 import tempfile
 import time
 import traceback
-from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
-from io import StringIO
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
 
 
 ###############################################################################
-# Inlined from KernelBench — timing utilities
+# Device handle injected into solutions
+###############################################################################
+#
+# A ttnn device is expensive to open and cannot be opened twice, so the bench
+# opens ONE device and hands it to the solution instead of letting the solution
+# open its own. It is injected two ways so a solution can use whichever it
+# prefers:
+#   1. as the module-level global ``DEVICE`` in the solution's namespace, and
+#   2. via ``ttnn.SetDefaultDevice(device)`` (when that API is present) so ops
+#      that fall back to the implicit default device also work.
+# Solutions should place tensors with ``ttnn.from_torch(t, ..., device=DEVICE)``.
+
+
+def _to_torch(x: Any) -> Any:
+    """Convert a ttnn.Tensor back to a torch.Tensor; pass everything else through.
+
+    Solutions normally return a torch tensor (having called ttnn.to_torch
+    themselves), but tolerate a solution that returns the raw ttnn.Tensor.
+    """
+    if isinstance(x, torch.Tensor):
+        return x
+    # Duck-type a ttnn.Tensor without importing ttnn at module load time.
+    if x.__class__.__module__.startswith("ttnn"):
+        import ttnn
+
+        return ttnn.to_torch(x)
+    return x
+
+
+###############################################################################
+# Correctness — Pearson Correlation Coefficient (PCC)
 ###############################################################################
 
 
-def clear_l2_cache(device: torch.device | str = "cuda"):
-    """Clear L2 cache by thrashing with a large tensor (~256 MB)."""
-    dummy = torch.empty((32, 1024, 1024), dtype=torch.int64, device=device)
-    dummy.fill_(42)
-    del dummy
+def comp_pcc(golden: torch.Tensor, calculated: torch.Tensor, pcc: float = 0.99):
+    """Pearson Correlation Coefficient between two tensors — the standard TT
+    correctness metric (see tt-metal ``models.common.utility_functions.comp_pcc``).
+
+    Returns ``(passing: bool, pcc_value: float)``. NaN/Inf entries are masked to
+    zero before correlating; constant tensors are compared on their max value;
+    identical tensors and all-NaN-vs-all-NaN return 1.0.
+
+    PCC (not a tight allclose) is used because TT kernels run in bfloat16 /
+    bfloat8_b, whose few mantissa bits make element-wise agreement to fp32-grade
+    tolerance physically impossible even for a correct kernel.
+    """
+    golden = golden.detach().flatten().to(torch.float32)
+    calculated = calculated.detach().flatten().to(torch.float32)
+
+    if golden.shape != calculated.shape:
+        return False, 0.0
+
+    g_all_nan = bool(torch.all(torch.isnan(golden)))
+    c_all_nan = bool(torch.all(torch.isnan(calculated)))
+    if g_all_nan and c_all_nan:
+        return True, 1.0
+    if g_all_nan or c_all_nan:
+        return False, 0.0
+
+    if torch.equal(golden, calculated):
+        return True, 1.0
+
+    # Zero each tensor's OWN non-finite entries independently (matches tt-metal's
+    # per-tensor nan_to_num). A single union mask applied to both would also zero
+    # the golden wherever the *solution* emitted NaN/Inf, hiding the divergence
+    # and inflating PCC to a false pass — a NaN-producing kernel would score
+    # correct.
+    golden = torch.nan_to_num(golden, nan=0.0, posinf=0.0, neginf=0.0)
+    calculated = torch.nan_to_num(calculated, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Pearson correlation is undefined when a tensor has zero variance. Shapes
+    # already match here, so numel<2 means both are scalars.
+    g_const = golden.numel() < 2 or golden.std().item() == 0.0
+    c_const = calculated.numel() < 2 or calculated.std().item() == 0.0
+    if g_const or c_const:
+        if g_const and c_const:
+            # Both (near-)constant: compare the value with a precision-aware
+            # loose tolerance — NOT torch.isclose defaults (rtol=1e-5/atol=1e-8),
+            # which are unreachable in bf16 and would false-fail a correct
+            # low-precision kernel.
+            close = bool(
+                torch.isclose(golden.mean(), calculated.mean(), rtol=2e-2, atol=1e-2)
+            )
+            return close, (1.0 if close else 0.0)
+        # Exactly one side is constant while the other varies — a genuine
+        # mismatch (e.g. a solution returning a constant vs a varying golden).
+        return False, 0.0
+
+    cc = torch.corrcoef(torch.stack([golden, calculated]))[0, 1].item()
+    if math.isnan(cc):
+        return False, 0.0
+    return cc >= pcc, float(cc)
 
 
-def time_execution_with_cuda_event(
+###############################################################################
+# Timing
+###############################################################################
+
+
+def time_execution_host(
     kernel_fn: callable,
-    args: list[Any],
+    make_args: callable,
+    device: Any,
     num_warmup: int = 3,
-    num_trials: int = 10,
+    num_trials: int = 100,
     discard_first: int = 1,
     verbose: bool = True,
-    device: torch.device = None,
 ) -> list[float]:
+    """Time a callable with a host wall-clock, synchronizing the TT device each
+    trial. Returns a list of elapsed times in milliseconds.
+
+    ``make_args()`` returns a fresh argument list per trial (fresh inputs are
+    part of the anti-cheat and also avoid measuring cache-warm-on-identical-data
+    effects). ``device`` may be None (CPU reference), in which case no device
+    sync is performed. The first ``discard_first`` trials are dropped; on TT the
+    very first run JIT-compiles kernels and fills the program cache.
     """
-    Time a CUDA kernel over multiple trials using torch.cuda.Event.
-    Measures cold-cache performance (L2 thrashed before each trial).
+    ttnn = None
+    if device is not None:
+        import ttnn  # noqa: F401  (lazy — self-test / CPU path needs no ttnn)
 
-    Returns list of elapsed times in milliseconds.
-    """
-    if device is None:
-        device = torch.cuda.current_device()
+    def _sync():
+        if ttnn is not None:
+            ttnn.synchronize_device(device)
 
-    with torch.cuda.device(device):
-        # Warm ups
-        for _ in range(num_warmup):
-            kernel_fn(*args)
-            torch.cuda.synchronize(device=device)
-
-        torch.cuda.empty_cache()
-
-        print(
-            f"[Profiling] Using device: {device} {torch.cuda.get_device_name(device)}, "
-            f"warm up {num_warmup}, trials {num_trials}"
-        )
-
-        elapsed_times: list[float] = []
-
-        for trial in range(num_trials + discard_first):
-            torch.cuda.synchronize(device=device)
-
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-
-            clear_l2_cache(device=device)
-
-            start_event.record()
-            _ = kernel_fn(*args)
-            end_event.record()
-
-            torch.cuda.synchronize(device=device)
-
-            elapsed_time_ms = start_event.elapsed_time(end_event)
-
-            if trial >= discard_first:
-                if verbose:
-                    logical_idx = trial - discard_first + 1
-                    print(f"Trial {logical_idx}: {elapsed_time_ms:.3g} ms")
-                elapsed_times.append(elapsed_time_ms)
-
-    return elapsed_times
-
-
-def time_execution_with_host_time(
-    kernel_fn: callable,
-    args: list[Any],
-    num_warmup: int = 3,
-    num_trials: int = 10,
-    discard_first: int = 1,
-    verbose: bool = True,
-    device: torch.device | None = None,
-) -> list[float]:
-    """
-    Time a CUDA kernel using host-side wall-clock time (perf_counter).
-    Includes Python overhead, launch costs, and synchronization.
-
-    Returns list of elapsed times in milliseconds.
-    """
-    if device is None:
-        device = torch.cuda.current_device()
-
+    # Warm up: triggers kernel JIT build + program-cache population on TT.
     for _ in range(num_warmup):
-        kernel_fn(*args)
-        torch.cuda.synchronize(device=device)
+        kernel_fn(*make_args())
+        _sync()
 
-    print(
-        f"[Profiling] Using device: {device} {torch.cuda.get_device_name(device)}, "
-        f"warm up {num_warmup}, trials {num_trials}"
-    )
+    if verbose and device is not None:
+        print(f"[Profiling] Host timing on TT device, warmup {num_warmup}, trials {num_trials}")
 
-    torch.cuda.empty_cache()
-    elapsed_times = []
-
+    elapsed_times: list[float] = []
     for trial in range(num_trials + discard_first):
-        torch.cuda.synchronize(device=device)
-        clear_l2_cache(device=device)
+        args = make_args()
+        _sync()
+        start = time.perf_counter()
+        _ = kernel_fn(*args)
+        _sync()
+        end = time.perf_counter()
 
-        start_time = time.perf_counter()
-        kernel_fn(*args)
-        torch.cuda.synchronize(device=device)
-        end_time = time.perf_counter()
-
-        elapsed_time_ms = (end_time - start_time) * 1000
+        elapsed_ms = (end - start) * 1000.0
         if trial >= discard_first:
             if verbose:
-                logical_idx = trial - discard_first + 1
-                print(f"Trial {logical_idx}: {elapsed_time_ms:.3g} ms")
-            elapsed_times.append(elapsed_time_ms)
+                print(f"Trial {trial - discard_first + 1}: {elapsed_ms:.3g} ms")
+            elapsed_times.append(elapsed_ms)
 
     return elapsed_times
 
 
-def get_timing_function(method: str = "cuda_event") -> callable:
-    """
-    Return timing function by method name.
-
-    Available: "cuda_event" (default), "host_time".
-    """
-    print(f"[Profiling] Using timing method: {method}")
-    match method:
-        case "cuda_event":
-            return time_execution_with_cuda_event
-        case "host_time":
-            return time_execution_with_host_time
-        case _:
-            raise ValueError(
-                f"Unsupported timing method: {method}. "
-                f"Available: cuda_event, host_time"
-            )
-
-
-def get_timing_stats(elapsed_times: list[float], device: torch.device = None) -> dict:
+def get_timing_stats(elapsed_times: list[float]) -> dict:
     """Compute mean/std/min/max from a list of elapsed times (ms)."""
     mean_val = statistics.mean(elapsed_times)
     std_val = statistics.stdev(elapsed_times) if len(elapsed_times) > 1 else 0.0
-
-    stats = {
+    return {
         "mean": float(f"{mean_val:.3g}"),
         "std": float(f"{std_val:.3g}"),
         "min": float(f"{min(elapsed_times):.3g}"),
@@ -210,15 +238,9 @@ def get_timing_stats(elapsed_times: list[float], device: torch.device = None) ->
         "num_trials": len(elapsed_times),
     }
 
-    if device:
-        stats["hardware"] = torch.cuda.get_device_name(device=device)
-        stats["device"] = str(device)
-
-    return stats
-
 
 ###############################################################################
-# Inlined from KernelBench — eval utilities
+# Eval scaffolding
 ###############################################################################
 
 
@@ -229,50 +251,15 @@ class KernelExecResult:
     compiled: bool = False
     correctness: bool = False
     metadata: dict = field(default_factory=dict)
-    runtime: float = -1.0  # ms
+    pcc: float = -1.0
+    runtime: float = -1.0  # ms (solution, on device)
     runtime_stats: dict = field(default_factory=dict)
-    ref_runtime: float = -1.0  # ms
+    ref_runtime: float = -1.0  # ms (reference, on CPU)
     ref_runtime_stats: dict = field(default_factory=dict)
 
 
 def set_seed(seed: int):
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-
-
-def get_tolerance_for_precision(precision: Union[str, torch.dtype]) -> float:
-    """
-    Tolerance for correctness checks, inspired by torchbench.
-
-    fp32: 1e-4, fp16/bf16: 1e-2.
-    """
-    if isinstance(precision, str):
-        dtype_map = {
-            "fp32": torch.float32,
-            "float32": torch.float32,
-            "fp16": torch.float16,
-            "float16": torch.float16,
-            "bf16": torch.bfloat16,
-            "bfloat16": torch.bfloat16,
-        }
-        precision = dtype_map[precision]
-
-    tolerances = {
-        torch.float32: 1e-4,
-        torch.float16: 1e-2,
-        torch.bfloat16: 1e-2,
-    }
-    assert precision in tolerances, f"Unsupported precision: {precision}"
-    return tolerances[precision]
-
-
-def _process_input_tensor(
-    inp, device, backend="cuda", precision=torch.float32
-):
-    """Move tensor to device with correct dtype. Non-tensors pass through."""
-    if not isinstance(inp, torch.Tensor):
-        return inp
-    return inp.to(dtype=precision, device=device)
 
 
 def get_error_name(e: Exception) -> str:
@@ -282,12 +269,10 @@ def get_error_name(e: Exception) -> str:
 def load_original_model_and_inputs(
     model_original_src: str, context: dict, source_path: Optional[str] = None
 ) -> tuple:
-    """
-    exec() the reference source. Returns (Model, get_init_inputs, get_inputs).
+    """exec() the reference source. Returns (Model, get_init_inputs, get_inputs).
 
-    If source_path is given, it is injected as __file__ in the exec context so
-    the loaded code can use os.path.dirname(__file__) to find sibling files
-    (e.g., multi-file CUDA solutions loaded via torch.utils.cpp_extension.load).
+    If source_path is given it is injected as __file__ so the reference can find
+    sibling files via os.path.dirname(__file__).
     """
     if source_path is not None:
         context["__file__"] = os.path.abspath(source_path)
@@ -311,70 +296,51 @@ def load_original_model_and_inputs(
     )
 
 
-def load_custom_model(
+def load_solution_model(
     model_custom_src: str,
-    context: dict,
-    build_directory: str = None,
+    device: Any,
     source_path: Optional[str] = None,
-) -> Optional[nn.Module]:
-    """Load ModelNew via exec() (CUDA backend).
-
-    If source_path is given, it is injected as __file__ in the exec context so
-    solutions that use `os.path.dirname(__file__)` (e.g., multi-file
-    `torch.utils.cpp_extension.load(sources=[...])`) can find their sibling
-    files.
-    """
-    if source_path is not None:
-        context["__file__"] = os.path.abspath(source_path)
-
-    if build_directory:
-        context["BUILD_DIRECTORY"] = build_directory
-        model_custom_src = (
-            "import os\n"
-            f"os.environ['TORCH_EXTENSIONS_DIR'] = '{build_directory}'\n"
-        ) + model_custom_src
-
-    try:
-        compile(model_custom_src, "<string>", "exec")
-        exec(model_custom_src, context)
-    except SyntaxError as e:
-        print(f"Syntax Error in custom generated code or Compilation Error {e}")
-        return None
-
-    return context.get("ModelNew")
-
-
-def load_custom_model_with_tempfile(model_custom_src, entry_point="ModelNew"):
-    """Load ModelNew via tempfile + importlib (Triton/TileLang/CuTe backend)."""
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False
-    ) as tmp_file:
-        tmp_file.write(model_custom_src)
-        tempfile_path = tmp_file.name
-        temp_file = tmp_file
-
-    spec = importlib.util.spec_from_file_location("temp_module", tempfile_path)
-    temp_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(temp_module)
-
-    ModelNew = getattr(temp_module, entry_point)
-    return ModelNew, temp_file
-
-
-def graceful_eval_cleanup(
-    curr_context: dict,
-    device: torch.device,
-    temp_file=None,
+    entry_point: str = "ModelNew",
 ):
-    """Clean up GPU cache and optional tempfile after evaluation."""
-    del curr_context
-    with torch.cuda.device(device):
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(device=device)
-        torch.cuda.synchronize(device=device)
-    if temp_file:
-        temp_file.close()
-        os.remove(temp_file.name)
+    """Load ModelNew from solution source via importlib.
+
+    The transformed source is written to a temp file **in the solution's own
+    directory** so that a tt-metal solution referencing sibling kernel files
+    (e.g. `os.path.dirname(__file__) + "/kernels/reader.cpp"`) still resolves
+    them. The opened TT `device` is injected as the module global ``DEVICE``.
+
+    Returns (ModelNew, temp_path). Caller removes temp_path.
+    """
+    sol_dir = (
+        os.path.dirname(os.path.abspath(source_path))
+        if source_path
+        else tempfile.gettempdir()
+    )
+    fd, tmp_path = tempfile.mkstemp(suffix=".py", prefix=".ako_eval_", dir=sol_dir)
+    with os.fdopen(fd, "w") as f:
+        f.write(model_custom_src)
+
+    spec = importlib.util.spec_from_file_location("ako_solution_module", tmp_path)
+    module = importlib.util.module_from_spec(spec)
+    # Inject the device before executing module-level code so top-level setup can
+    # use it too.
+    setattr(module, "DEVICE", device)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        # Surface the import/compile failure to the caller; clean up the temp file.
+        os.remove(tmp_path)
+        raise
+
+    return getattr(module, entry_point, None), tmp_path
+
+
+def graceful_eval_cleanup(temp_path: Optional[str] = None):
+    if temp_path and os.path.exists(temp_path):
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
 
 
 def register_and_format_exception(
@@ -400,416 +366,316 @@ def run_and_check_correctness(
     get_inputs_fn: callable,
     metadata: dict,
     num_correct_trials: int,
+    pcc_threshold: float,
     verbose: bool = False,
     seed: int = 42,
-    device: Optional[torch.device] = None,
-    backend: str = "cuda",
-    precision: torch.dtype = torch.float32,
 ) -> KernelExecResult:
-    """Run model and check correctness over multiple random-input trials."""
+    """Run reference (CPU) and solution (TT) over fresh-input trials, comparing
+    with PCC. The reference is the golden; PCC on fresh random inputs is the
+    anti-cheat (a constant/precomputed output fails)."""
     pass_count = 0
+    min_pcc = 1.0
 
     torch.manual_seed(seed)
-    correctness_trial_seeds = [
-        torch.randint(0, 2**32 - 1, (1,)).item()
-        for _ in range(num_correct_trials)
+    trial_seeds = [
+        torch.randint(0, 2**31 - 1, (1,)).item() for _ in range(num_correct_trials)
     ]
 
     with torch.no_grad():
         for trial in range(num_correct_trials):
-            trial_seed = correctness_trial_seeds[trial]
+            trial_seed = trial_seeds[trial]
             if verbose:
-                print(f"[Eval] Generating Random Input with seed {trial_seed}")
+                print(f"[Eval] Generating random input with seed {trial_seed}")
 
             set_seed(trial_seed)
-            inputs = get_inputs_fn()
-            inputs = [
-                _process_input_tensor(x, device, backend, precision) for x in inputs
-            ]
-
+            ref_inputs = get_inputs_fn()
+            # Reference runs on CPU as the fp32 golden. Give the solution its own
+            # fresh copies so it cannot mutate the reference's inputs.
             set_seed(trial_seed)
-            model = original_model_instance.to(device=device, dtype=precision)
+            sol_inputs = get_inputs_fn()
 
-            set_seed(trial_seed)
-            model_new = new_model_instance.to(device=device, dtype=precision)
-
-            output = model(*inputs)
-            torch.cuda.synchronize(device=device)
+            ref_output = original_model_instance(*ref_inputs)
 
             try:
-                output_new = model_new(*inputs)
-                torch.cuda.synchronize(device=device)
+                sol_output = _to_torch(new_model_instance(*sol_inputs))
 
-                if output.shape != output_new.shape:
-                    metadata = register_and_format_exception(
+                if not isinstance(ref_output, torch.Tensor):
+                    metadata["correctness_issue"] = "Reference did not return a tensor"
+                    return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
+
+                ref_cpu = ref_output.detach().to(torch.float32).cpu()
+                sol_cpu = sol_output.detach().to(torch.float32).cpu()
+
+                if ref_cpu.shape != sol_cpu.shape:
+                    register_and_format_exception(
                         "correctness_issue",
-                        f"Output shape mismatch: Expected {output.shape}, got {output_new.shape}",
+                        f"Output shape mismatch: expected {ref_cpu.shape}, got {sol_cpu.shape}",
                         metadata,
                     )
-                    metadata["correctness_issue_name"] = "correctness_issue"
                     if verbose:
                         print(
-                            f"[FAIL] trial {trial}: Output shape mismatch: "
-                            f"Expected {output.shape}, got {output_new.shape}"
+                            f"[FAIL] trial {trial}: shape mismatch "
+                            f"{ref_cpu.shape} vs {sol_cpu.shape}"
                         )
-                    return KernelExecResult(
-                        compiled=True, correctness=False, metadata=metadata
-                    )
+                    return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
 
-                tolerance = get_tolerance_for_precision(precision)
-                if not torch.allclose(
-                    output, output_new, atol=tolerance, rtol=tolerance
-                ):
-                    max_diff = torch.max(torch.abs(output - output_new)).item()
-                    avg_diff = torch.mean(torch.abs(output - output_new)).item()
-                    metadata.setdefault("max_difference", []).append(
-                        f"{max_diff:.6f}"
-                    )
-                    metadata.setdefault("avg_difference", []).append(
-                        f"{avg_diff:.6f}"
-                    )
-                    metadata["correctness_issue"] = "Output mismatch"
-                    if verbose:
-                        print(f"[FAIL] trial {trial}: Output mismatch")
-                else:
+                passing, pcc_val = comp_pcc(ref_cpu, sol_cpu, pcc_threshold)
+                min_pcc = min(min_pcc, pcc_val)
+                if passing:
                     pass_count += 1
                     if verbose:
-                        print(f"[PASS] trial {trial}: New Model matches Model")
+                        print(f"[PASS] trial {trial}: PCC {pcc_val:.6f} >= {pcc_threshold}")
+                else:
+                    metadata.setdefault("pcc_values", []).append(f"{pcc_val:.6f}")
+                    metadata["correctness_issue"] = (
+                        f"PCC {pcc_val:.6f} below threshold {pcc_threshold}"
+                    )
+                    if verbose:
+                        print(f"[FAIL] trial {trial}: PCC {pcc_val:.6f} < {pcc_threshold}")
 
             except Exception as e:
-                print("[Error] Exception happens during correctness check")
-                print(f"Error in launching kernel for ModelNew: {e}")
+                print("[Error] Exception during correctness check")
+                print(f"Error running solution ModelNew: {e}")
                 print("\n[Full Traceback]:")
                 traceback.print_exc()
                 print()
-
-                metadata = register_and_format_exception(
-                    "runtime_error", e, metadata, truncate=True
-                )
+                register_and_format_exception("runtime_error", e, metadata, truncate=True)
                 metadata["runtime_error_name"] = get_error_name(e)
                 metadata["runtime_error_traceback"] = traceback.format_exc()
-                return KernelExecResult(
-                    compiled=True, correctness=False, metadata=metadata
-                )
-
-    if verbose:
-        print(
-            f"[Eval] Pass count: {pass_count}, num_correct_trials: {num_correct_trials}"
-        )
+                return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
 
     metadata["correctness_trials"] = f"({pass_count} / {num_correct_trials})"
-
-    if pass_count == num_correct_trials:
-        return KernelExecResult(compiled=True, correctness=True, metadata=metadata)
-    else:
-        return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
+    metadata["min_pcc"] = f"{min_pcc:.6f}"
+    correct = pass_count == num_correct_trials
+    return KernelExecResult(
+        compiled=True, correctness=correct, pcc=min_pcc, metadata=metadata
+    )
 
 
 def eval_kernel_against_ref(
     original_model_src: str,
     custom_model_src: str,
     seed_num: int = 42,
-    num_correct_trials: int = 1,
-    num_perf_trials: int = 10,
-    measure_performance: bool = False,
-    timing_method: str = "cuda_event",
+    num_correct_trials: int = 5,
+    num_perf_trials: int = 100,
+    measure_performance: bool = True,
+    pcc_threshold: float = 0.99,
     verbose: bool = False,
-    build_dir: os.PathLike = None,
-    device: Union[torch.device, int] = None,
-    backend: str = "cuda",
-    precision: torch.dtype = torch.float32,
-    check_for_excessive_speedup: bool = True,
-    excessive_speedup_threshold: float = 10,
+    device_id: int = 0,
+    backend: str = "ttnn",
     measure_reference: bool = True,
     get_inputs_override: Optional[callable] = None,
     get_init_inputs_override: Optional[callable] = None,
     ref_path: Optional[str] = None,
     sol_path: Optional[str] = None,
-) -> KernelExecResult:
+) -> Optional[KernelExecResult]:
+    """Evaluate a solution kernel on a Tenstorrent device against a CPU golden.
+
+    Opens one TT device (via ttnn), loads the reference (CPU) and solution (TT),
+    checks PCC correctness over fresh-input trials, and times the solution on the
+    device (host wall-clock + ttnn.synchronize_device, first run discarded).
+
+    ``measure_reference=False`` skips the CPU reference timing (REF_RUNTIME /
+    SPEEDUP left at -1): the reference is invariant across solution edits, so for
+    fast per-iteration signal rank candidates by the solution's own RUNTIME.
     """
-    Evaluate a custom kernel against the reference model.
-
-    Compiles and loads both models, checks correctness, and optionally
-    measures performance (timing + speedup).
-
-    `measure_reference=False` skips reference timing (and the >threshold
-    reward-hack flag, which needs the ref/solution ratio): COMPILED / CORRECT /
-    RUNTIME are still produced, but REF_RUNTIME / SPEEDUP are left unset (-1).
-    Use it for fast "signal" iteration — rank candidates by the solution's own
-    RUNTIME, since the reference is invariant across solution edits and re-timing
-    it every iteration is wasted work for an expensive reference. Run with
-    measure_reference=True (the default) for the "verdict" before committing a
-    winner. Note correctness still runs the reference num_correct_trials times.
-
-    If `get_inputs_override` / `get_init_inputs_override` are provided, they
-    take precedence over any definitions found inside `original_model_src`.
-
-    If `ref_path` / `sol_path` are provided, they are injected as `__file__`
-    into the respective exec contexts so code that uses
-    `os.path.dirname(__file__)` to find sibling files (e.g. multi-file
-    `cpp_extension.load(sources=[...])`) works. Only effective for the CUDA
-    backend (exec-based loader); Triton/TileLang/CuTe backends load via
-    tempfile so `__file__` already points at a real `.py` (but the tempfile
-    path, not the original source).
-    """
-    assert torch.cuda.is_available(), "CUDA is not available, cannot run Eval"
-
-    if device is None:
-        device = torch.cuda.current_device()
-
-    torch.set_printoptions(
-        precision=4, threshold=10, edgeitems=3, linewidth=80
-    )
-
-    torch.cuda.set_device(device)
-
-    uses_tempfile = backend.lower() in ["triton", "tilelang", "cute"]
-
-    metadata = {}
-    metadata["hardware"] = torch.cuda.get_device_name(device=device)
-    metadata["device"] = str(device)
-
-    if uses_tempfile:
-        if isinstance(device, int):
-            device_num = device
-        elif isinstance(device, torch.device):
-            assert device.type == "cuda", "CUDA is not available on device"
-            device_num = device.index
-        else:
-            raise ValueError(
-                f"device must be an int or torch.device, got {type(device)}"
-            )
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(device_num)
-
-    context = {}
-
-    if verbose:
-        print(f"[Eval] Start Evaluation! on device: {device}")
-        print("[Eval] Loading Original Model")
-
-    Model, ref_get_init_inputs, ref_get_inputs = load_original_model_and_inputs(
-        original_model_src, context, source_path=ref_path
-    )
-
-    # Override chain: explicit override > definition inside reference file.
-    # get_inputs is required (no sensible default); get_init_inputs defaults to [].
-    get_inputs = (
-        get_inputs_override if get_inputs_override is not None else ref_get_inputs
-    )
-    get_init_inputs = (
-        get_init_inputs_override
-        if get_init_inputs_override is not None
-        else ref_get_init_inputs
-    )
-
-    if get_inputs is None:
-        msg = (
-            "get_inputs() not found. Define it in the reference file or pass "
-            "--inputs <file> with a top-level get_inputs() function."
+    try:
+        import ttnn
+    except Exception as e:  # pragma: no cover - depends on the host
+        print(
+            "[Eval] Could not import ttnn — a Tenstorrent (tt-metal/TT-NN) install "
+            "is required. Install tt-metal and set PYTHONPATH/TT_METAL_HOME.\n"
+            f"Error: {e}"
         )
-        print(f"[Eval] {msg}")
-        metadata["error"] = "missing_get_inputs"
-        metadata["error_message"] = msg
+        metadata = {"error": "ttnn_import_failed", "error_message": str(e)}
         return KernelExecResult(compiled=False, metadata=metadata)
 
-    set_seed(seed_num)
-    init_inputs = [] if get_init_inputs is None else get_init_inputs()
-    init_inputs = [
-        _process_input_tensor(x, device, backend, precision) for x in init_inputs
-    ]
+    metadata: dict = {"backend": backend}
 
-    with torch.no_grad():
-        set_seed(seed_num)
-        original_model = Model(*init_inputs)
-        assert hasattr(original_model, "forward")
-        if verbose:
-            print("[Eval] Original Model Loaded")
-
-    if verbose:
-        print("[Eval] Loading and Compiling New Model with Custom CUDA Kernel")
-
-    # Compilation
+    # --- Open the device ---
     try:
-        os.environ["TORCH_USE_CUDA_DSA"] = "1"
-        temp_file = None
-
-        if backend.lower() in ["triton", "tilelang", "cute"]:
-            ModelNew, temp_file = load_custom_model_with_tempfile(
-                custom_model_src, entry_point="ModelNew"
-            )
-        else:
-            ModelNew = load_custom_model(
-                custom_model_src, context, build_dir, source_path=sol_path
-            )
-        torch.cuda.synchronize(device=device)
+        device = ttnn.open_device(device_id=device_id)
     except Exception as e:
-        print(
-            f"Failed to compile custom CUDA kernel: Record as compilation failure.\nError: {e}"
+        print(f"[Eval] Failed to open Tenstorrent device {device_id}: {e}")
+        return KernelExecResult(
+            compiled=False,
+            metadata={"error": "device_open_failed", "error_message": str(e)},
         )
-        if "lock" in str(e) or "No such file or directory" in str(e):
-            print(f"[Eval] Lock file error during compilation, Please retry. Error: {e}")
-            graceful_eval_cleanup(context, device, temp_file)
-            return None
-        else:
-            metadata["compilation_error_name"] = get_error_name(e)
-            metadata["compilation_error"] = str(e)
-            graceful_eval_cleanup(context, device, temp_file)
+
+    # Program cache + default device are best-effort conveniences; ttnn versions
+    # differ on whether these exist / are needed (newer builds auto-cache).
+    for fn in ("enable_program_cache",):
+        try:
+            getattr(device, fn)()
+        except Exception:
+            pass
+    try:
+        ttnn.SetDefaultDevice(device)
+    except Exception:
+        pass
+
+    metadata["device"] = f"tt:{device_id}"
+    try:
+        metadata["arch"] = os.environ.get("ARCH_NAME", "unknown")
+    except Exception:
+        pass
+
+    temp_path = None
+    try:
+        # --- Load reference (CPU golden) ---
+        if verbose:
+            print("[Eval] Loading reference model (CPU golden)")
+        ref_context: dict = {"DEVICE": device}
+        loaded = load_original_model_and_inputs(
+            original_model_src, ref_context, source_path=ref_path
+        )
+        if loaded is None:
+            metadata["error"] = "reference_load_failed"
+            return KernelExecResult(compiled=False, metadata=metadata)
+        Model, ref_get_init_inputs, ref_get_inputs = loaded
+
+        get_inputs = get_inputs_override if get_inputs_override is not None else ref_get_inputs
+        get_init_inputs = (
+            get_init_inputs_override
+            if get_init_inputs_override is not None
+            else ref_get_init_inputs
+        )
+
+        if get_inputs is None:
+            msg = (
+                "get_inputs() not found. Define it in the reference file or pass "
+                "--inputs <file> with a top-level get_inputs()."
+            )
+            print(f"[Eval] {msg}")
+            metadata["error"] = "missing_get_inputs"
+            metadata["error_message"] = msg
             return KernelExecResult(compiled=False, metadata=metadata)
 
-    if ModelNew is None:
-        print(
-            "Failed to load custom model: Syntax error or ModelNew not found. "
-            "Record as compilation failure."
-        )
-        metadata["compilation_error_name"] = "SyntaxError"
-        metadata["compilation_error"] = (
-            "Syntax error in custom generated code or ModelNew not found"
-        )
-        graceful_eval_cleanup(context, device, temp_file)
-        return KernelExecResult(compiled=False, metadata=metadata)
-
-    # Instantiate custom model
-    try:
-        with torch.no_grad():
-            set_seed(seed_num)
-            custom_model = ModelNew(*init_inputs)
-            assert hasattr(custom_model, "forward")
-            original_model = original_model.to(device=device, dtype=precision)
-            custom_model = custom_model.to(device=device, dtype=precision)
-            torch.cuda.synchronize(device=device)
-        if verbose:
-            print("[Eval] New Model with Custom CUDA Kernel Loaded")
-    except RuntimeError as e:
-        print(
-            f"Failed to load custom CUDA kernel; Compiled but not able to run.\nError: {e}"
-        )
-        graceful_eval_cleanup(context, device, temp_file)
-        metadata["runtime_error"] = str(e)
-        metadata["runtime_error_name"] = get_error_name(e)
-        return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
-
-    # Correctness
-    kernel_exec_result = None
-    if verbose:
-        print("[Eval] Checking Correctness")
-    try:
-        kernel_exec_result = run_and_check_correctness(
-            original_model,
-            custom_model,
-            get_inputs,
-            metadata=metadata,
-            num_correct_trials=num_correct_trials,
-            verbose=verbose,
-            seed=seed_num,
-            device=device,
-            backend=backend,
-            precision=precision,
-        )
-    except Exception as e:
-        metadata["runtime_error"] = str(e)
-        metadata["runtime_error_name"] = get_error_name(e)
-        kernel_exec_result = KernelExecResult(
-            compiled=True, correctness=False, metadata=metadata
-        )
-
-    # Performance measurement
-    if measure_performance:
         try:
-            if kernel_exec_result and kernel_exec_result.correctness:
-                if verbose:
-                    print("[Eval] Measuring Performance as Sample is Correct")
-
-                torch.cuda.synchronize(device=device)
+            set_seed(seed_num)
+            init_inputs = [] if get_init_inputs is None else get_init_inputs()
+            with torch.no_grad():
                 set_seed(seed_num)
-                inputs = get_inputs()
-                inputs = [
-                    _process_input_tensor(x, device, backend, precision)
-                    for x in inputs
-                ]
+                original_model = Model(*init_inputs)
+                assert hasattr(original_model, "forward")
+        except Exception as e:
+            print(f"Failed to construct reference model: {e}")
+            metadata["error"] = "reference_instantiation_failed"
+            metadata["error_message"] = str(e)
+            return KernelExecResult(compiled=False, metadata=metadata)
 
-                model_new = custom_model.to(device=device, dtype=precision)
-                torch.cuda.synchronize(device=device)
+        # --- Load + build solution (TT) ---
+        if verbose:
+            print("[Eval] Loading solution model (TT device)")
+        try:
+            ModelNew, temp_path = load_solution_model(
+                custom_model_src, device, source_path=sol_path
+            )
+        except SyntaxError as e:
+            metadata["compilation_error_name"] = "SyntaxError"
+            metadata["compilation_error"] = str(e)
+            return KernelExecResult(compiled=False, metadata=metadata)
+        except Exception as e:
+            print(f"Failed to load/compile solution: {e}")
+            metadata["compilation_error_name"] = get_error_name(e)
+            metadata["compilation_error"] = str(e)
+            return KernelExecResult(compiled=False, metadata=metadata)
 
-                timing_fn = get_timing_function(timing_method)
-                elapsed_times = timing_fn(
-                    model_new,
-                    inputs,
+        if ModelNew is None:
+            metadata["compilation_error_name"] = "MissingModelNew"
+            metadata["compilation_error"] = "ModelNew not found in solution"
+            return KernelExecResult(compiled=False, metadata=metadata)
+
+        try:
+            with torch.no_grad():
+                set_seed(seed_num)
+                custom_model = ModelNew(*init_inputs)
+                assert hasattr(custom_model, "forward")
+        except Exception as e:
+            print(f"Failed to instantiate ModelNew: {e}")
+            metadata["runtime_error"] = str(e)
+            metadata["runtime_error_name"] = get_error_name(e)
+            return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
+
+        # --- Correctness (PCC) ---
+        if verbose:
+            print("[Eval] Checking correctness (PCC)")
+        try:
+            result = run_and_check_correctness(
+                original_model,
+                custom_model,
+                get_inputs,
+                metadata=metadata,
+                num_correct_trials=num_correct_trials,
+                pcc_threshold=pcc_threshold,
+                verbose=verbose,
+                seed=seed_num,
+            )
+        except Exception as e:
+            metadata["runtime_error"] = str(e)
+            metadata["runtime_error_name"] = get_error_name(e)
+            result = KernelExecResult(compiled=True, correctness=False, metadata=metadata)
+
+        # --- Performance (solution on device) ---
+        if measure_performance and result.correctness:
+            if verbose:
+                print("[Eval] Measuring solution performance on device")
+            try:
+                def make_sol_args():
+                    return get_inputs()
+
+                elapsed = time_execution_host(
+                    custom_model,
+                    make_sol_args,
+                    device,
                     num_trials=num_perf_trials,
                     verbose=verbose,
-                    device=device,
                 )
-                runtime_stats = get_timing_stats(elapsed_times, device=device)
-
+                stats = get_timing_stats(elapsed)
+                result.runtime = stats["mean"]
+                result.runtime_stats = stats
                 if verbose:
-                    print(f"[Eval] Performance Stats: {runtime_stats}")
-                kernel_exec_result.runtime = runtime_stats["mean"]
-                kernel_exec_result.runtime_stats = runtime_stats
+                    print(f"[Eval] Solution runtime stats: {stats}")
+            except Exception as e:
+                if verbose:
+                    print(f"[Eval] Error measuring solution performance: {e}")
+                result.metadata["error_during_performance"] = str(e)
 
-        except Exception as e:
+        # --- Reference timing (CPU) for a speedup denominator ---
+        if measure_performance and measure_reference and result.correctness:
             if verbose:
-                print(f"[Eval] Error in Measuring Performance: {e}")
-            kernel_exec_result.metadata["error_during_performance"] = str(e)
+                print("[Eval] Measuring reference performance on CPU")
+            try:
+                def make_ref_args():
+                    return get_inputs()
 
-    # Reference timing (for speedup) + the excessive-speedup reward-hack flag,
-    # which needs the ref/solution ratio. Skipped when measure_reference=False:
-    # the reference is invariant across solution edits, so re-timing it every
-    # iteration is wasted work for an expensive reference. Fast "signal" runs
-    # rank by the solution's own RUNTIME; the default "verdict" run restores
-    # REF_RUNTIME, SPEEDUP, and the reward-hack flag.
-    if measure_performance and check_for_excessive_speedup and measure_reference:
-        if verbose:
-            print("[Eval] Additional checks to flag excessive speedup")
+                ref_elapsed = time_execution_host(
+                    original_model,
+                    make_ref_args,
+                    None,  # CPU — no device sync
+                    num_trials=num_perf_trials,
+                    verbose=verbose,
+                )
+                ref_stats = get_timing_stats(ref_elapsed)
+                result.ref_runtime = ref_stats["mean"]
+                result.ref_runtime_stats = ref_stats
+            except Exception as e:
+                if verbose:
+                    print(f"[Eval] Error measuring reference performance: {e}")
+                result.metadata["error_during_ref_performance"] = str(e)
 
-        torch.cuda.synchronize(device=device)
-        set_seed(seed_num)
-        inputs = get_inputs()
-        inputs = [
-            _process_input_tensor(x, device, backend, precision) for x in inputs
-        ]
+        return result
 
-        torch.cuda.synchronize(device=device)
-
-        timing_fn = get_timing_function(timing_method)
-        reference_elapsed_times = timing_fn(
-            original_model,
-            inputs,
-            num_trials=num_perf_trials,
-            verbose=verbose,
-            device=device,
-        )
-        reference_runtime_stats = get_timing_stats(
-            reference_elapsed_times, device=device
-        )
-        kernel_exec_result.ref_runtime = reference_runtime_stats["mean"]
-        kernel_exec_result.ref_runtime_stats = reference_runtime_stats
-
-        effective_speedup = (
-            kernel_exec_result.ref_runtime / kernel_exec_result.runtime
-        )
-
-        if verbose:
-            print(
-                f"[Eval] Effective Speedup is {effective_speedup:.2f}x "
-                f"using timing method {timing_method}"
-            )
-
-        if effective_speedup > excessive_speedup_threshold:
-            kernel_exec_result.metadata["excessive_speedup"] = True
-            print(
-                f"[WARNING] Excessive speedup {effective_speedup:.2f}x "
-                f"over {excessive_speedup_threshold}x threshold detected"
-            )
-            print(
-                "[WARNING] Double check your kernel carefully to ensure "
-                "it is not reward hacking."
-            )
-
-    graceful_eval_cleanup(context, device, temp_file)
-    return kernel_exec_result
+    finally:
+        graceful_eval_cleanup(temp_path)
+        try:
+            ttnn.close_device(device)
+        except Exception:
+            pass
 
 
 ###############################################################################
-# Source transformation (from original kernelbench-bench.py)
+# Source transformation (anti-cheat boundary — inherited from KernelBench)
 ###############################################################################
 
 
@@ -819,24 +685,24 @@ def read_file(path: str) -> str:
 
 
 def rename_model_to_modelnew(src: str) -> str:
-    """
-    Rename `class Model(...)` -> `class ModelNew(...)` in solution source.
-    Also renames `super(Model, self)` -> `super(ModelNew, self)`.
+    """Rename the solution's `Model` class to `ModelNew`.
+
+    Renames every standalone `Model` identifier — the class def, `super(Model,
+    self)`, and in-body references like `isinstance(x, Model)` or
+    `Model.some_staticmethod(...)`. Renaming only the class def would leave those
+    references bound to a name that no longer exists (NameError at eval). `\\bModel\\b`
+    does not match inside `ModelNew` / `MyModel` / `ModelBuilder` (word boundaries)
+    or the lowercase `model`.
     """
     if re.search(r"\bclass\s+ModelNew\b", src):
         return src  # already has ModelNew
 
-    src = re.sub(r"\bclass\s+Model\s*\(", "class ModelNew(", src)
-    src = re.sub(r"\bsuper\s*\(\s*Model\s*,", "super(ModelNew,", src)
-    return src
+    return re.sub(r"\bModel\b", "ModelNew", src)
 
 
 def _find_tail_section(src: str) -> int:
-    """
-    Find character offset where the "tail section" begins (module-level code
-    after the *last* class body: variables like N=2048, get_inputs(),
-    get_init_inputs()).
-    """
+    """Find char offset where module-level code after the *last* class begins
+    (variables like N=2048, get_inputs(), get_init_inputs())."""
     lines = src.split("\n")
     last_class_idx = -1
 
@@ -857,16 +723,14 @@ def _find_tail_section(src: str) -> int:
 
 
 def prepare_solution_source(sol_src: str) -> str:
-    """
-    Prepare solution source for eval:
-    1. Rename class Model -> class ModelNew
-    2. Strip solution's tail section (module-level vars, get_inputs,
-       get_init_inputs, etc.).
+    """Prepare solution source for eval:
+    1. Rename class Model -> class ModelNew.
+    2. Strip the solution's tail section (module-level vars, get_inputs,
+       get_init_inputs).
 
-    The tail strip is the anti-cheat boundary: get_inputs / get_init_inputs
-    come from the reference file or the --inputs file, never from the solution.
-    Stripping prevents the solution (which is exec'd into the same context as
-    the reference) from silently overriding them.
+    The tail strip is the anti-cheat boundary: get_inputs / get_init_inputs come
+    from the reference or the --inputs file, never from the solution, so the
+    solution cannot choose the inputs it is tested against.
     """
     modified = rename_model_to_modelnew(sol_src)
     sol_tail_start = _find_tail_section(modified)
@@ -874,27 +738,34 @@ def prepare_solution_source(sol_src: str) -> str:
 
 
 def _auto_detect_backend(sol_src: str) -> str:
-    """Pick backend from solution source. Conservative — defaults to cuda.
+    """Pick a backend label from solution source. Informational — both backends
+    load the same way (a Python file whose forward runs on the TT device).
 
-    The `cuda` return also covers HIP at the loader level (both go through the
-    exec-based path); pass `--backend hip` explicitly if labelling matters.
+    tt-metal (low-level C++ Tensix kernels launched from Python) is detected by
+    tt-metal host-API / kernel markers; otherwise the solution is treated as
+    TT-NN (ttnn op library). Defaults to ttnn.
     """
-    if "@triton.jit" in sol_src or "import triton" in sol_src:
-        return "triton"
-    if "import tilelang" in sol_src:
-        return "tilelang"
-    if "import cute" in sol_src or "cute_dsl" in sol_src:
-        return "cute"
-    return "cuda"
+    tt_metal_markers = (
+        "CreateKernel",
+        "CreateProgram",
+        "EnqueueProgram",
+        "CircularBufferConfig",
+        "tt_metal",
+        "tt::tt_metal",
+        "ttnn.experimental",
+        "program_factory",
+        "get_program_cache",
+    )
+    if any(m in sol_src for m in tt_metal_markers):
+        return "tt-metal"
+    if "import ttnn" in sol_src or "ttnn." in sol_src:
+        return "ttnn"
+    return "ttnn"
 
 
-def load_inputs_module(path: str) -> tuple[Optional[callable], Optional[callable]]:
-    """
-    Load `get_inputs` (required) and `get_init_inputs` (optional) from an
-    external Python file. Used when the user supplies `--inputs <file>` to
-    decouple test-input definition from the reference kernel file.
-
-    Returns (get_inputs, get_init_inputs). The latter may be None.
+def load_inputs_module(path: str):
+    """Load get_inputs (required) and get_init_inputs (optional) from a file.
+    Used when --inputs decouples test-input definition from the reference file.
     """
     spec = importlib.util.spec_from_file_location("ako_inputs_module", path)
     if spec is None or spec.loader is None:
@@ -906,20 +777,18 @@ def load_inputs_module(path: str) -> tuple[Optional[callable], Optional[callable
     get_init_inputs = getattr(module, "get_init_inputs", None)
 
     if get_inputs is None:
-        raise ValueError(
-            f"Inputs file {path} must define a top-level get_inputs() function"
-        )
+        raise ValueError(f"Inputs file {path} must define a top-level get_inputs()")
 
     return get_inputs, get_init_inputs
 
 
 ###############################################################################
-# Self-test for source transformation
+# Self-test (hardware-independent — no ttnn / no device required)
 ###############################################################################
 
 
 def _self_test():
-    """Verify source transformation and inputs-loading logic."""
+    """Verify source transformation, backend detection, inputs loading, and PCC."""
     sol = '''import torch
 import torch.nn as nn
 
@@ -939,23 +808,16 @@ def get_init_inputs():
     return [42]
 '''
     result = prepare_solution_source(sol)
-
-    # Must have ModelNew, not Model
     assert "class ModelNew(" in result, "ModelNew rename failed"
     assert "class Model(" not in result, "Original Model class still present"
     assert "super(ModelNew," in result, "super() rename failed"
-
-    # Solution tail must be stripped — anti-cheat boundary
     assert "N = 4096" not in result, "Solution's N must not leak"
     assert "def get_inputs" not in result, "Solution's get_inputs must be stripped"
-    assert "def get_init_inputs" not in result, (
-        "Solution's get_init_inputs must be stripped"
-    )
+    assert "def get_init_inputs" not in result, "Solution's get_init_inputs must be stripped"
     assert "return [42]" not in result, "Solution's get_init_inputs body must be stripped"
-
     print("Self-test PASSED: source transformation is correct.")
 
-    # --- Multi-class regression (issue #7) ---
+    # --- Multi-class regression ---
     sol_multi = '''import torch
 import torch.nn as nn
 
@@ -986,13 +848,8 @@ def get_init_inputs():
     assert "class ModelNew(" in result_multi, "ModelNew rename failed (multi-class)"
     assert "def helper_fn" in result_multi, "helper_fn should be preserved"
     assert "N = 4096" not in result_multi, "Solution's N must not leak (multi-class)"
-    assert "def get_inputs" not in result_multi, (
-        "Solution's get_inputs must be stripped (multi-class)"
-    )
-    assert "return [42]" not in result_multi, (
-        "Solution's get_init_inputs body must be stripped"
-    )
-    print("Self-test PASSED: multi-class transformation is correct (issue #7).")
+    assert "def get_inputs" not in result_multi, "Solution's get_inputs must be stripped (multi-class)"
+    print("Self-test PASSED: multi-class transformation is correct.")
 
     # --- No-class edge case ---
     no_class_src = "import torch\nN = 1\n"
@@ -1000,37 +857,81 @@ def get_init_inputs():
         "No class: entire source should be kept (offset == len)"
     print("Self-test PASSED: no-class edge case.")
 
-    # --- load_inputs_module: both get_inputs and get_init_inputs ---
+    # --- Backend auto-detection ---
+    assert _auto_detect_backend("import ttnn\nx = ttnn.matmul(a, b)") == "ttnn", \
+        "ttnn source should detect ttnn"
+    assert _auto_detect_backend(
+        "program = CreateProgram()\nCreateKernel(program, 'reader.cpp', core, cfg)"
+    ) == "tt-metal", "tt-metal host API should detect tt-metal"
+    assert _auto_detect_backend("import ttnn\nttnn.experimental.foo()") == "tt-metal", \
+        "ttnn.experimental custom op should detect tt-metal"
+    assert _auto_detect_backend("x = 1") == "ttnn", "unknown source defaults to ttnn"
+    print("Self-test PASSED: backend auto-detection.")
+
+    # --- PCC ---
+    a = torch.randn(1024)
+    passing, val = comp_pcc(a, a.clone(), 0.99)
+    assert passing and abs(val - 1.0) < 1e-6, f"identical tensors must give PCC 1.0, got {val}"
+    # A global scale is a documented PCC blind spot: still ~1.0.
+    passing, val = comp_pcc(a, a * 2.0, 0.99)
+    assert passing and val > 0.99, f"scaled tensor should still correlate, got {val}"
+    # Uncorrelated noise (constant-vs-noise style garbage) should fail.
+    b = torch.randn(1024)
+    passing, val = comp_pcc(a, b, 0.99)
+    assert not passing, f"independent noise should fail PCC, got {val}"
+    # bfloat16 round-trip stays well above a 0.99 gate.
+    passing, val = comp_pcc(a, a.to(torch.bfloat16).to(torch.float32), 0.99)
+    assert passing and val > 0.99, f"bf16 round-trip should pass PCC, got {val}"
+    # Shape mismatch fails.
+    passing, val = comp_pcc(a, torch.randn(512), 0.99)
+    assert not passing, "shape mismatch must fail"
+    print("Self-test PASSED: PCC metric.")
+
+    # NaN in the solution where the golden is finite must FAIL — per-tensor
+    # masking, not a union that would zero the golden there and hide it.
+    g = torch.tensor([1.0, 2.0, 3.0, 100.0])
+    passing, _ = comp_pcc(g, torch.tensor([1.0, 2.0, 3.0, float("nan")]), 0.99)
+    assert not passing, "NaN divergence in the solution must fail PCC"
+    # Constant fallback: matching constants pass; a constant vs a varying tensor
+    # fails in either direction (the latter is the return-a-constant anti-cheat).
+    passing, _ = comp_pcc(torch.full((64,), 2.0), torch.full((64,), 2.0), 0.99)
+    assert passing, "matching constant tensors must pass"
+    passing, _ = comp_pcc(torch.full((64,), 2.0), torch.randn(64) + 100.0, 0.99)
+    assert not passing, "constant golden vs varying solution must fail"
+    passing, _ = comp_pcc(torch.arange(64.0), torch.full((64,), 5.0), 0.99)
+    assert not passing, "varying golden vs constant solution must fail (anti-cheat)"
+    print("Self-test PASSED: PCC edge cases (NaN divergence, constant fallback).")
+
+    # In-body class references must also be renamed, or they NameError at eval.
+    sol_ref = '''import torch.nn as nn
+
+class Model(nn.Module):
+    def forward(self, x):
+        assert isinstance(self, Model)
+        return Model.scale(x)
+
+    @staticmethod
+    def scale(x):
+        return x * 2
+'''
+    r = prepare_solution_source(sol_ref)
+    assert "isinstance(self, ModelNew)" in r, "in-body isinstance ref must be renamed"
+    assert "ModelNew.scale(x)" in r, "in-body staticmethod ref must be renamed"
+    assert not re.search(r"\bModel\b", r), "no bare Model may survive the rename"
+    print("Self-test PASSED: in-body Model references renamed.")
+
+    # --- load_inputs_module ---
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-        f.write(
-            "def get_inputs():\n"
-            "    return [1, 2, 3]\n"
-            "\n"
-            "def get_init_inputs():\n"
-            "    return ['a']\n"
-        )
+        f.write("def get_inputs():\n    return [1, 2, 3]\n\ndef get_init_inputs():\n    return ['a']\n")
         tmp_path = f.name
     try:
         gi, gii = load_inputs_module(tmp_path)
-        assert gi() == [1, 2, 3], "load_inputs_module: get_inputs return mismatch"
-        assert gii() == ["a"], "load_inputs_module: get_init_inputs return mismatch"
+        assert gi() == [1, 2, 3], "get_inputs return mismatch"
+        assert gii() == ["a"], "get_init_inputs return mismatch"
         print("Self-test PASSED: load_inputs_module (both functions).")
     finally:
         os.remove(tmp_path)
 
-    # --- load_inputs_module: get_inputs only ---
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-        f.write("def get_inputs():\n    return [42]\n")
-        tmp_path = f.name
-    try:
-        gi, gii = load_inputs_module(tmp_path)
-        assert gi() == [42]
-        assert gii is None, "get_init_inputs should be None when absent"
-        print("Self-test PASSED: load_inputs_module (get_inputs only).")
-    finally:
-        os.remove(tmp_path)
-
-    # --- load_inputs_module: missing get_inputs must raise ---
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write("def get_init_inputs():\n    return []\n")
         tmp_path = f.name
@@ -1052,73 +953,70 @@ def get_init_inputs():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate optimized kernel against reference (self-contained KernelBench)"
+        description="Evaluate an optimized Tenstorrent kernel against a reference (self-contained)"
     )
     parser.add_argument(
         "--ref",
         default=None,
-        help="Path to reference kernel (with class Model). "
+        help="Path to reference kernel (defines class Model, the CPU golden). "
              "Required unless --self-test is given.",
     )
     parser.add_argument(
         "--solution",
         default=None,
-        help="Path to optimized kernel (with class Model - renamed automatically). "
+        help="Path to optimized solution (defines class Model — renamed to "
+             "ModelNew automatically; runs on the TT device). "
              "Required unless --self-test is given.",
     )
     parser.add_argument(
         "--inputs",
         default=None,
-        help="Optional path to a separate Python file defining get_inputs() "
-             "(required) and get_init_inputs() (optional). When provided, "
-             "these override any definitions found in --ref.",
+        help="Optional file defining get_inputs() (required) and get_init_inputs() "
+             "(optional); overrides definitions in --ref.",
     )
     parser.add_argument(
-        "--timing-method",
-        default="cuda_event",
-        choices=["cuda_event", "host_time"],
-        help="GPU timing method (default: cuda_event)",
-    )
-    parser.add_argument(
-        "--precision",
-        default="float32",
-        choices=["float32", "float16", "bfloat16"],
-        help="Precision for evaluation (default: float32)",
+        "--pcc",
+        type=float,
+        default=0.99,
+        help="PCC (Pearson Correlation Coefficient) threshold for correctness "
+             "(default: 0.99). Use 0.999 / 0.9999 for stricter fp32/bf16 checks.",
     )
     parser.add_argument(
         "--backend",
         default=None,
-        choices=["cuda", "triton", "tilelang", "cute", "hip"],
-        help="Backend for kernel compilation. Auto-detected from solution source if omitted.",
+        choices=["ttnn", "tt-metal"],
+        help="Backend label. Auto-detected from solution source if omitted "
+             "(ttnn = TT-NN op library; tt-metal = low-level C++ Tensix kernels). "
+             "Informational — both load the same way.",
+    )
+    parser.add_argument(
+        "--device-id", type=int, default=0, help="Tenstorrent device id (default: 0)"
     )
     parser.add_argument(
         "--num-correct-trials",
         type=int,
         default=5,
-        help="Number of correctness trials (default: 5)",
+        help="Number of correctness (PCC) trials (default: 5)",
     )
     parser.add_argument(
         "--num-perf-trials",
         type=int,
         default=100,
-        help="Number of performance trials (default: 100)",
+        help="Number of performance timing trials (default: 100)",
     )
     parser.add_argument(
         "--no-ref",
         action="store_true",
-        help="Skip reference timing: still emit COMPILED/CORRECT/RUNTIME but set "
-             "REF_RUNTIME/SPEEDUP to -1 (and skip the >threshold reward-hack flag, "
-             "which needs the reference ratio). For fast iteration on an expensive "
-             "reference — rank candidates by the solution's own RUNTIME. Omit it "
-             "for the full verdict run before committing a winner.",
+        help="Skip reference (CPU) timing: still emit COMPILED/CORRECT/PCC/RUNTIME "
+             "but set REF_RUNTIME/SPEEDUP to -1. For fast iteration — rank "
+             "candidates by the solution's own RUNTIME (the reference is "
+             "invariant across solution edits).",
     )
-    parser.add_argument(
-        "--verbose", action="store_true", help="Enable verbose output"
-    )
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument(
         "--self-test",
         action="store_true",
-        help="Run source transformation self-test and exit",
+        help="Run source-transformation / PCC self-test and exit (no device needed)",
     )
 
     args = parser.parse_args()
@@ -1130,12 +1028,13 @@ def main():
     if args.ref is None or args.solution is None:
         parser.error("--ref and --solution are required (unless --self-test is given)")
 
-    precision_map = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }
-    precision = precision_map[args.precision]
+    if args.num_correct_trials < 1:
+        parser.error(
+            "--num-correct-trials must be >= 1 (a zero-trial run would vacuously "
+            "pass without ever comparing to the golden)"
+        )
+    if args.num_perf_trials < 1:
+        parser.error("--num-perf-trials must be >= 1")
 
     ref_src = read_file(args.ref)
     sol_src = read_file(args.solution)
@@ -1169,17 +1068,17 @@ def main():
         print(modified_sol_src[:500], "..." if len(modified_sol_src) > 500 else "")
         print()
 
-    result: KernelExecResult = eval_kernel_against_ref(
+    result = eval_kernel_against_ref(
         original_model_src=ref_src,
         custom_model_src=modified_sol_src,
         num_correct_trials=args.num_correct_trials,
         num_perf_trials=args.num_perf_trials,
         measure_performance=True,
         measure_reference=not args.no_ref,
-        timing_method=args.timing_method,
+        pcc_threshold=args.pcc,
         verbose=args.verbose,
+        device_id=args.device_id,
         backend=args.backend,
-        precision=precision,
         get_inputs_override=get_inputs_override,
         get_init_inputs_override=get_init_inputs_override,
         ref_path=args.ref,
@@ -1190,36 +1089,32 @@ def main():
         print("COMPILED: False")
         print("CORRECT: False")
         print(f"BACKEND: {args.backend} ({backend_origin})")
+        print("PCC: -1")
         print("RUNTIME: -1")
         print("REF_RUNTIME: -1")
         print("SPEEDUP: -1")
-        print("ERROR: eval_kernel_against_ref returned None (possible lock file error)")
+        print("ERROR: eval_kernel_against_ref returned None")
         sys.exit(1)
 
     runtime_ms = result.runtime if result.runtime > 0 else -1
     ref_runtime_ms = result.ref_runtime if result.ref_runtime > 0 else -1
-
-    if runtime_ms > 0 and ref_runtime_ms > 0:
-        speedup = ref_runtime_ms / runtime_ms
-    else:
-        speedup = -1
+    speedup = ref_runtime_ms / runtime_ms if (runtime_ms > 0 and ref_runtime_ms > 0) else -1
 
     print(f"COMPILED: {result.compiled}")
     print(f"CORRECT: {result.correctness}")
     print(f"BACKEND: {args.backend} ({backend_origin})")
+    print(f"PCC: {result.pcc:.6f}" if result.pcc >= 0 else "PCC: -1")
     print(f"RUNTIME: {runtime_ms:.4f}" if runtime_ms > 0 else "RUNTIME: -1")
-    print(
-        f"REF_RUNTIME: {ref_runtime_ms:.4f}" if ref_runtime_ms > 0 else "REF_RUNTIME: -1"
-    )
+    print(f"REF_RUNTIME: {ref_runtime_ms:.4f}" if ref_runtime_ms > 0 else "REF_RUNTIME: -1")
     print(f"SPEEDUP: {speedup:.4f}x" if speedup > 0 else "SPEEDUP: -1")
 
     if args.verbose:
         print()
         print("--- Details ---")
         if result.runtime_stats:
-            print(f"Runtime stats: {result.runtime_stats}")
+            print(f"Runtime stats (TT): {result.runtime_stats}")
         if result.ref_runtime_stats:
-            print(f"Ref runtime stats: {result.ref_runtime_stats}")
+            print(f"Ref runtime stats (CPU): {result.ref_runtime_stats}")
         if result.metadata:
             for k, v in result.metadata.items():
                 print(f"  {k}: {v}")
