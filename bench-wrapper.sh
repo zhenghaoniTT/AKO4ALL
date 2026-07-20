@@ -1,22 +1,32 @@
 #!/bin/bash
-# Benchmark wrapper with trajectory tracking
+# Benchmark wrapper with trajectory tracking (Tenstorrent / tt-metal).
 # Usage: bash scripts/bench.sh [label]
 set -eo pipefail
 cd "$(dirname "$0")/.."
 
-# Detect toolkit-vs-torch ambiguity and warn — don't auto-set CUDA_HOME.
-# Auto-set is unreliable when active conda env != target python env (e.g.,
-# base shell running envs/X/bin/python directly), and a wrong CUDA_HOME
-# silently produces ABI mismatches in torch.cpp_extension / load_inline
-# (e.g., cu130 torch + cu117 nvcc → cudaDeviceProp mismatch → SIGFPE).
-# Common on multi-CUDA hosts.
-if ! [ -x "${CUDA_HOME%%:*}/bin/nvcc" ]; then
-    TORCH_CU=$(python -c "import torch; print(torch.version.cuda)" 2>/dev/null || echo "")
-    if [ -n "$TORCH_CU" ]; then
-        echo "[bench-wrapper] CUDA_HOME=${CUDA_HOME:-(unset)} → no nvcc found; torch built with CUDA $TORCH_CU." >&2
-        echo "  For load_inline / cpp_extension, export CUDA_HOME to the env whose nvcc matches CUDA $TORCH_CU, e.g.:" >&2
-        echo "    export CUDA_HOME=\$(python -c 'import sys; print(sys.prefix)')" >&2
-    fi
+# --- Tenstorrent environment sanity checks (warn, don't fail) ---
+# The default evaluator needs an importable `ttnn` and a reachable TT device.
+# tt-metal usually lives outside the workspace; if so, export TT_METAL_HOME,
+# add it to PYTHONPATH, and set ARCH_NAME (wormhole_b0 / blackhole) HERE — this
+# template is meant to be edited for your environment (see SKILL.md "env
+# friction"). Uncomment / adjust:
+#
+#   export TT_METAL_HOME=/path/to/tt-metal
+#   export PYTHONPATH="$TT_METAL_HOME:$PYTHONPATH"
+#   export ARCH_NAME=wormhole_b0
+#   # source /path/to/conda/etc/profile.d/conda.sh && conda activate <env>
+
+if [ -z "${TT_METAL_HOME:-}" ]; then
+    echo "[bench-wrapper] TT_METAL_HOME is not set. If ttnn is not already on" >&2
+    echo "  PYTHONPATH, export TT_METAL_HOME/PYTHONPATH/ARCH_NAME at the top of" >&2
+    echo "  this script (see SKILL.md)." >&2
+fi
+if ! python -c "import ttnn" 2>/dev/null; then
+    echo "[bench-wrapper] 'import ttnn' failed — a tt-metal / TT-NN install must be" >&2
+    echo "  importable by this python. Check PYTHONPATH / your conda env." >&2
+fi
+if [ -z "${ARCH_NAME:-}" ]; then
+    echo "[bench-wrapper] ARCH_NAME unset (expected wormhole_b0 or blackhole)." >&2
 fi
 
 LABEL="${1:-}"

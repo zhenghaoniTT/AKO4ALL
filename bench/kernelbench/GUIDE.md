@@ -1,6 +1,6 @@
-# KernelBench Default Benchmark
+# Tenstorrent KernelBench Default Benchmark
 
-Self-contained evaluation script for AKO4ALL. Inlines core logic from [KernelBench](https://github.com/KernelBench/KernelBench) so no external dependency is needed.
+Self-contained evaluation script for AKO4ALL, targeting **Tenstorrent** (tt-metal / TT-NN). It keeps the KernelBench-format contract (`class Model` + `get_inputs`) but runs the solution on a Tenstorrent device and scores it with PCC (Pearson Correlation Coefficient) against a CPU PyTorch golden. Core logic is inlined so no external KernelBench dependency is needed. Requires a working `ttnn` install and a reachable Tenstorrent device (only `--self-test` runs without either).
 
 ## Setup
 
@@ -16,28 +16,39 @@ Three pieces must be reachable at eval time:
 | `get_inputs()` returning sample input tensors | `--inputs` file > `--ref` file | Yes |
 | `get_init_inputs()` returning constructor args | `--inputs` file > `--ref` file > defaults to `[]` | No |
 
-The agent's job during Setup is to assemble these three pieces from whatever the user provided — usually by pointing `--ref` / `--inputs` at the files in their existing locations, or (only when a new helper file is genuinely needed, e.g., wrapping raw `.npz` data) by writing into `source/`. Don't move or copy existing user files just to canonicalize paths. How to assemble them is up to the agent.
+The agent's job during Setup is to assemble these from whatever the user provided — usually by pointing `--ref` / `--inputs` at the files in their existing locations, or (only when a new helper file is genuinely needed, e.g. wrapping raw `.npz` data) by writing into `source/`. Don't move or copy existing user files just to canonicalize paths.
+
+### The device contract (how the solution runs on Tenstorrent)
+
+The **reference** `class Model` is plain PyTorch and runs on the **CPU** — it is the numerical golden, nothing else. The **solution** `class Model` (renamed to `ModelNew`) runs on the **Tenstorrent device**. The contract:
+
+- `forward(self, *inputs)` receives **torch CPU tensors** (the same `get_inputs()` tensors the reference sees) and must return a **torch tensor** (or a `ttnn.Tensor`, which the bench converts with `ttnn.to_torch`).
+- Inside `forward`, the solution does the device round-trip itself: `ttnn.from_torch(x, dtype=..., layout=ttnn.TILE_LAYOUT, device=DEVICE) → ttnn ops (or a tt-metal program) → ttnn.to_torch(out)`.
+- The opened TT device is injected as the module-level global **`DEVICE`** (and set as the ttnn default device where that API exists). Do **not** call `ttnn.open_device` inside the solution — use `DEVICE`.
+- `__init__(self, *init_inputs)` may build persistent `ttnn` weight tensors on `DEVICE` from the (CPU) init inputs.
+
+RUNTIME is the solution's end-to-end device latency (including the host↔device transfer), timed with a host wall-clock bracketed by `ttnn.synchronize_device(DEVICE)`, with the first (compile) run discarded.
 
 ### Common assembly patterns
 
-These are typical paths, not rules. Use whichever shape fits the situation.
+These are typical paths, not rules.
 
-- **KernelBench-format input** — A single file already contains all three pieces. Use it directly as `--ref`; omit `--inputs`.
-- **Raw kernel** (CUDA / Triton / CuTe-DSL / TileLang / ...) — Wrap the kernel into a `class Model` (e.g., `torch.utils.cpp_extension.load_inline` for CUDA) and define `get_inputs()`. Either keep both in one file used as `--ref`, or split: `class Model` in `--ref`, `get_inputs()` in a separate `source/inputs.py` passed via `--inputs`.
-- **Kernel + separate input data** — User provides a kernel plus data in some non-Python format (`.npz`, `.bin`, shape lists in `.txt`, etc.). Wrap the kernel into `class Model` in `--ref`, then write `source/inputs.py` whose `get_inputs()` loads the data file (`np.load`, `torch.load`, custom parser — agent's call) and returns tensors. Pass it via `--inputs`.
-- **Kernel referenced by external path** — User points at a kernel outside this repo (e.g., a path into a KernelBench dataset). `--ref` and `--inputs` accept arbitrary paths; no need to copy files into `source/`.
+- **TT-NN op** — the solution is a Python file whose `forward` calls `ttnn` ops. Reference is the equivalent PyTorch op. Use the ref directly as `--ref`; the solution as `--solution`.
+- **tt-metal Tensix kernel** — the solution is a Python host wrapper that builds/launches C++ kernels (reader / compute / writer `.cpp`, circular buffers) via `ttnn` / `tt_metal`. Keep the `.cpp` kernel files **next to** the solution `.py` (the bench loads the solution from a temp file in its own directory so `os.path.dirname(__file__)`-relative kernel paths still resolve).
+- **Kernel + separate input data** — user provides a kernel plus data in a non-Python format (`.npz`, `.pt`, `.bin`, shape lists). Keep the reference in `--ref`, then write `source/inputs.py` whose `get_inputs()` loads the data (`np.load`, `torch.load`, custom parser) and returns torch tensors. Pass it via `--inputs`.
+- **Kernel referenced by external path** — `--ref` / `--inputs` accept arbitrary paths (e.g. into a model repo); no need to copy files into `source/`.
 
 ### Pitfall: `get_inputs()` must produce fresh data per call
 
-The bench script calls `get_inputs()` once per correctness trial (5 by default) and again for timing. If `get_inputs()` returns a module-level cached tensor, every trial sees identical data — correctness checks pass trivially and timing reflects cache-warm performance. Make `get_inputs()` regenerate inputs each call (`torch.randn`, re-`np.load`, etc.).
+The bench calls `get_inputs()` once per correctness trial (5 by default) and again for timing. If it returns a module-level cached tensor, every trial sees identical data — the PCC check passes trivially and timing reflects cache-warm behavior. Regenerate each call (`torch.randn`, re-`np.load`, etc.). Fresh-input PCC is the anti-cheat: a constant / precomputed output fails.
 
 ### Bench command
 
 ```
-python bench/kernelbench/bench.py --ref <ref-path>.py --solution solution/<kernel>.py [--inputs <inputs-path>.py] --verbose
+python bench/kernelbench/bench.py --ref <ref-path>.py --solution solution/<kernel>.py [--inputs <inputs-path>.py] --pcc 0.99 --verbose
 ```
 
-If the file passed to `--inputs` also defines `get_init_inputs()`, it overrides the ref's version too. The solution file keeps `class Model` — the bench script transparently renames it to `class ModelNew` before evaluation.
+If the file passed to `--inputs` also defines `get_init_inputs()`, it overrides the ref's version too. The solution file keeps `class Model` — the bench transparently renames it to `class ModelNew` before evaluation.
 
 ### Fast iteration on an expensive reference
 
@@ -46,11 +57,11 @@ The reference is re-run for every correctness trial *and* re-timed for the speed
 ```
 # signal (fast): rank by RUNTIME, no reference timing
 python bench/kernelbench/bench.py --ref <ref>.py --solution solution/<k>.py --no-ref --num-perf-trials 20
-# verdict (before declaring a winner): full run, real SPEEDUP + reward-hack check
+# verdict (before declaring a winner): full run, real SPEEDUP + full PCC re-check
 python bench/kernelbench/bench.py --ref <ref>.py --solution solution/<k>.py
 ```
 
-`--no-ref` leaves `REF_RUNTIME`/`SPEEDUP` at -1 and skips the >10× reward-hack flag (it needs the ratio); correctness still runs the reference `--num-correct-trials` times, so trim that too (keep it ≥1) if the reference is the bottleneck. Never swap the comparison target to speed up the bench — only reduce how often the reference is paid for.
+`--no-ref` leaves `REF_RUNTIME`/`SPEEDUP` at -1; correctness still runs `--num-correct-trials` PCC trials, so trim that too (keep it ≥1) if the reference is the bottleneck. Never swap the comparison target to speed up the bench — only reduce how often the reference is paid for.
 
 ## Output Format
 
@@ -59,18 +70,24 @@ Each run prints structured lines (parsed by the agent):
 ```
 COMPILED: True
 CORRECT: True
+BACKEND: ttnn (auto)
+PCC: 0.999123
 RUNTIME: 0.4523
 REF_RUNTIME: 1.2301
 SPEEDUP: 2.7197x
 ```
 
-- **COMPILED** — whether the solution compiled successfully
-- **CORRECT** — whether outputs match the reference (within precision tolerance)
-- **RUNTIME** — solution kernel mean execution time in milliseconds
-- **REF_RUNTIME** — reference kernel mean execution time in milliseconds
-- **SPEEDUP** — `REF_RUNTIME / RUNTIME`
+- **COMPILED** — solution imported, `ModelNew` instantiated, and the kernels built (JIT for tt-metal, program build for ttnn) without throwing.
+- **CORRECT** — PCC ≥ threshold on every correctness trial (against the CPU golden).
+- **BACKEND** — `ttnn` or `tt-metal`, and whether it was `auto`-detected or `explicit`.
+- **PCC** — the minimum Pearson Correlation Coefficient across correctness trials (the accuracy margin).
+- **RUNTIME** — solution mean device latency in milliseconds (end-to-end, incl. host↔device transfer).
+- **REF_RUNTIME** — reference mean latency in milliseconds, on **CPU** (torch).
+- **SPEEDUP** — `REF_RUNTIME / RUNTIME`.
 
-Under `--no-ref`, `REF_RUNTIME` and `SPEEDUP` print as `-1` (reference not timed); `COMPILED`, `CORRECT`, and `RUNTIME` are unaffected.
+Under `--no-ref`, `REF_RUNTIME` and `SPEEDUP` print as `-1` (reference not timed); `COMPILED`, `CORRECT`, `PCC`, and `RUNTIME` are unaffected.
+
+> **Note on SPEEDUP:** the reference runs on CPU, so `SPEEDUP` compares TT-device time to CPU time — a coarse figure. The meaningful per-iteration signal is the solution's own **RUNTIME** (lower is better) and its improvement across iterations, exactly as the loop uses it.
 
 Exit code: `0` = correct, `1` = incorrect or failed.
 
@@ -78,59 +95,48 @@ Exit code: `0` = correct, `1` = incorrect or failed.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--ref` | (required) | Path to reference kernel (must define `class Model`) |
-| `--solution` | (required) | Path to optimized kernel |
+| `--ref` | (required) | Path to reference kernel (defines `class Model`, the CPU golden) |
+| `--solution` | (required) | Path to optimized kernel (defines `class Model`, runs on the TT device) |
 | `--inputs` | (none) | Optional file defining `get_inputs()` (required) and `get_init_inputs()` (optional); overrides definitions in `--ref` |
-| `--timing-method` | `cuda_event` | `cuda_event`, `host_time` |
-| `--precision` | `float32` | `float32`, `float16`, `bfloat16` |
-| `--backend` | auto-detected | `cuda`, `triton`, `tilelang`, `cute`, `hip` (auto-detected from solution source; pass explicitly to override — see below) |
-| `--num-correct-trials` | `5` | Number of correctness check iterations |
-| `--num-perf-trials` | `100` | Number of performance timing iterations |
-| `--no-ref` | off | Skip reference timing: emit `COMPILED`/`CORRECT`/`RUNTIME` but set `REF_RUNTIME`/`SPEEDUP` to -1 (and skip the reward-hack flag, which needs the ratio). Fast iteration on an expensive reference — rank by the solution's own `RUNTIME`. See "Fast iteration" below. |
+| `--pcc` | `0.99` | PCC correctness threshold. Use `0.999` / `0.9999` for fp32/bf16-strict ops |
+| `--backend` | auto-detected | `ttnn`, `tt-metal` (auto-detected from solution source; pass explicitly to override). Informational — both load the same way |
+| `--device-id` | `0` | Tenstorrent device id to open |
+| `--num-correct-trials` | `5` | Number of PCC correctness trials |
+| `--num-perf-trials` | `100` | Number of performance timing trials |
+| `--no-ref` | off | Skip reference (CPU) timing: emit `COMPILED`/`CORRECT`/`PCC`/`RUNTIME` but set `REF_RUNTIME`/`SPEEDUP` to -1. Fast iteration — rank by the solution's own `RUNTIME` |
 | `--verbose` | off | Print detailed debug info |
-| `--self-test` | off | Run source transformation self-test and exit |
+| `--self-test` | off | Run source-transformation / PCC self-test and exit (no ttnn / device needed) |
 
 ### Backend selection (auto-detected)
 
-`bench.py` picks the backend by sniffing the solution source: `@triton.jit` /
-`import triton` → `triton`; `import tilelang` → `tilelang`; `import cute` /
-`cute_dsl` → `cute`; otherwise `cuda` (exec-based loader handling raw CUDA +
-`cpp_extension.load[_inline]`). Pass `--backend <name>` only to override the
-sniff — useful for explicit HIP labelling or for mixed-backend solutions
-where the first match is wrong. The chosen backend is printed as
-`BACKEND: <name> (auto|explicit)` in the output.
+`bench.py` picks a backend label by sniffing the solution source: tt-metal host-API / kernel markers (`CreateKernel`, `CreateProgram`, `EnqueueProgram`, `CircularBufferConfig`, `tt_metal`, `ttnn.experimental`, `program_factory`, …) → `tt-metal`; otherwise `import ttnn` / `ttnn.` → `ttnn`; default `ttnn`. Pass `--backend <name>` only to override the sniff. The label is **informational** — both backends load the same way (a Python file whose `forward` runs on the device), so it does not change execution; it's recorded for the log. The chosen backend prints as `BACKEND: <name> (auto|explicit)`.
 
-The two loaders differ in how they execute solution code: `cuda` / `hip` use
-`exec()` (which rejects `@triton.jit` decorators with `@jit functions should
-be defined in a Python file`), while `triton` / `tilelang` / `cute` use
-tempfile + `importlib` so `@jit` source inspection works. `cuda` and `hip`
-are loader-equivalent; the distinction is informational only.
-
-| Solution language | Backend chosen |
-|-------------------|----------------|
-| Raw CUDA via `torch.utils.cpp_extension.load[_inline]` | `cuda` |
-| Triton (`@triton.jit`) | `triton` |
-| TileLang | `tilelang` |
-| CuTe | `cute` |
-| HIP | `cuda` (pass `--backend hip` explicitly if labelling matters) |
+| Solution shape | Backend label |
+|----------------|---------------|
+| TT-NN ops (`ttnn.matmul`, `ttnn.add`, …) | `ttnn` |
+| tt-metal host wrapper launching C++ Tensix kernels | `tt-metal` |
+| ttnn custom op via `ttnn.experimental` | `tt-metal` |
 
 ## Solution File Requirements
 
-- The solution file must contain `class Model(nn.Module)` with a `forward()` method matching the reference's signature.
-- The bench script handles `Model` -> `ModelNew` renaming transparently — **do not** rename the class in the solution file.
-- Do not include `get_inputs()` or `get_init_inputs()` in the solution file. The bench script strips the solution's module-level tail (variables and functions following the last class) as an anti-cheat boundary — any such definitions would be silently dropped, and the solution cannot influence which inputs it is tested against.
+- The solution file must contain `class Model(nn.Module)` with a `forward()` matching the reference's signature. It is renamed to `ModelNew` transparently — **do not** rename it yourself.
+- `forward` takes torch CPU tensors and returns a torch tensor (or `ttnn.Tensor`); it does the `ttnn.from_torch → ops → ttnn.to_torch` round-trip internally, using the injected `DEVICE` global.
+- Do not include `get_inputs()` / `get_init_inputs()` in the solution. The bench strips the solution's module-level tail (variables and functions after the last class) as an anti-cheat boundary — any such definitions are silently dropped, so the solution cannot influence which inputs it is tested against.
 
-## Correctness Tolerances
+## Correctness — PCC, not tight allclose
 
-Inspired by [torchbench](https://github.com/pytorch/benchmark):
+TT kernels run in low-precision formats (bfloat16 ≈ 8 mantissa bits; bfloat8_b / bfloat4_b fewer), so element-wise agreement with an fp32 golden to fp32-grade tolerance (`rtol=1e-5, atol=1e-8`) is physically impossible even for a *correct* kernel. The TT-standard metric is PCC (Pearson Correlation Coefficient), which measures whole-tensor correlation.
 
-| Precision | Tolerance (atol & rtol) |
-|-----------|------------------------|
-| float32   | 1e-4                   |
-| float16   | 1e-2                   |
-| bfloat16  | 1e-2                   |
+| Precision of the kernel | Typical PCC threshold |
+|-------------------------|-----------------------|
+| float32 / bfloat16 (accurate) | 0.999 – 0.9999 |
+| bfloat16 (default) | 0.99 – 0.999 |
+| bfloat8_b / bfloat4_b (aggressive) | 0.99 (or looser, if the user allows) |
 
-## Timing Methods
+The bench's `comp_pcc` masks NaN/Inf to zero, handles constant tensors by comparing their max value, and returns 1.0 for identical tensors. **PCC blind spot:** a global scale/bias (e.g. output ×2) can still yield PCC ≈ 1 — if an op is suspiciously "correct", sanity-check magnitudes separately.
 
-- **cuda_event** (default): Uses `torch.cuda.Event` for device-side timing. Measures cold-cache performance (L2 thrashed before each trial). Most accurate for GPU kernel time.
-- **host_time**: Host-side wall-clock timing via `time.perf_counter()`. Includes Python overhead, CUDA launch costs, and synchronization. Results may be longer than device-side timings.
+## Timing
+
+`bench.py` times with a **host wall-clock** around `forward`, calling `ttnn.synchronize_device(device)` before and after each trial (TT dispatch is asynchronous — without the sync you'd time only host enqueue). Warmup runs plus a discarded first trial absorb the JIT compile + program-cache population, so reported numbers are steady-state. This measures **end-to-end** latency including host↔device transfer.
+
+For **per-kernel device time** and bottleneck metrics (the deeper, `ncu`-style analysis — `DEVICE KERNEL DURATION [ns]`, per-RISC breakdown, MATH utilization, thread stall rates), use the tt-metal **device profiler (Tracy)** separately: build with the profiler, set `TT_METAL_DEVICE_PROFILER=1`, and run `./tools/tracy/profile_this.py -n <name> -c "pytest <test>"` → `generated/profiler/reports/ops_perf_results_<ts>.csv`. See `SKILL.md` ("Device profiler") and `knowledge/tenstorrent.md`.

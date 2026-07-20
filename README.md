@@ -1,26 +1,24 @@
-<h1 align="center">AKO4ALL</h1>
-<p align="center"><b>Agentic Kernel Optimization for All</b></p>
+<h1 align="center">AKO4ALL · Tenstorrent</h1>
+<p align="center"><b>Agentic Kernel Optimization for Tenstorrent</b></p>
 
 <p align="center">
-  <a href="https://tongminglaic.github.io/AKO"><img src="https://img.shields.io/badge/Project-Page-blue" alt="Project Page"></a>
-  <a href="https://github.com/TongmingLAIC/AKO4X"><img src="https://img.shields.io/badge/GitHub-AKO4X-blue?logo=github" alt="AKO4X"></a>
-  <a href="https://tongminglaic.github.io/AKO/assets/ako-tech-report.pdf"><img src="https://img.shields.io/badge/Tech%20Report-PDF-blue" alt="Tech Report"></a>
+  <a href="https://github.com/tenstorrent/tt-metal"><img src="https://img.shields.io/badge/Hardware-Tenstorrent-8A2BE2" alt="Tenstorrent"></a>
+  <a href="https://github.com/tenstorrent/tt-metal/tree/main/tech_reports"><img src="https://img.shields.io/badge/tt--metal-tech%20reports-blue" alt="tt-metal tech reports"></a>
+  <a href="https://tongminglaic.github.io/AKO"><img src="https://img.shields.io/badge/Upstream-AKO-lightgrey" alt="Upstream AKO"></a>
 </p>
 
-<p align="center"><b>If you find our work useful, please consider giving us a star 🌟</b></p>
+<p align="center"><b>A Tenstorrent adaptation of <a href="https://tongminglaic.github.io/AKO">AKO4ALL</a> — retargeted from NVIDIA/CUDA to tt-metal / TT-NN.</b></p>
 
 <p align="center">
-  <img src="assets/speedup_vs_expert.png" alt="Bar chart: AKO4ALL geomean speedup over the FlashInfer expert on four inference operators — GQA decode 1.36x, MLA decode 1.21x, MLA prefill 1.50x, RMSNorm 1.12x — on NVIDIA B200; all four bars clear the 1.0x expert line." width="640" />
+  <img src="assets/hero.png" alt="A cartoon robot agent at a single workshop bench iterates on a glowing kernel cube — with iteration logbook, profiler, timer, and commit stamp at hand, and a speedup chart on the chalkboard — illustrating AKO4ALL's single-session, drop-in kernel optimization loop." width="780" />
   <br/>
-  <i>Geomean speedup over the FlashInfer <b>expert</b> baseline (the strongest kernel FlashInfer ships) on NVIDIA B200 — every op clears the expert. Full table in <a href="#results">Results</a>.</i>
+  <i>Illustration of the single-session, drop-in optimization loop. (Original artwork from the upstream AKO project.)</i>
 </p>
 
 ## News
 
-- 📄 **[2026.05.31]** The **[AKO tech report](https://tongminglaic.github.io/AKO/assets/ako-tech-report.pdf)** is now available.
-- 🚀 **[2026.05.31]** [**AKO4X**](https://github.com/TongmingLAIC/AKO4X) is now open-source — the closed-loop, campaign-based system behind our [MLSys 2026 competition](https://mlsys26.flashinfer.ai/) entry.
-- ✨ **[2026.05.31]** **AKO4ALL** is now a single drop-in [Claude Code](https://docs.anthropic.com/en/docs/claude-code) skill — invoke it in any working directory.
-- 🚀 **[2026.03.24]** AKO4ALL is released.
+- ✨ **Tenstorrent adaptation** — AKO4ALL now targets Tenstorrent hardware (Wormhole / Blackhole) and kernels (tt-metal Tensix kernels + TT-NN ops). Correctness is PCC-based; profiling uses the tt-metal device profiler (Tracy). Knowledge distilled from the [tt-metal tech reports](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports).
+- ✨ AKO4ALL is a single drop-in [Claude Code](https://docs.anthropic.com/en/docs/claude-code) skill — invoke it in any working directory.
 
 **Table of Contents**
 
@@ -34,45 +32,39 @@
 - [Agent Behavior](#agent-behavior)
 - [Permissions](#permissions)
 - [Repo Layout](#repo-layout)
-- [Example: SOL-ExecBench](#example-sol-execbench)
+- [Example: optimize a TT-NN op](#example-optimize-a-tt-nn-op)
 - [Anti-Cheat](#anti-cheat)
 - [FAQ](#faq)
-- [Tech Report](#tech-report)
 - [Acknowledgments](#acknowledgments)
 
 ## What is AKO4ALL?
 
-**AKO4ALL is automated GPU kernel optimization, packaged as a single [Claude Code](https://docs.anthropic.com/en/docs/claude-code) skill.** Drop a kernel into your working directory, invoke the skill, and the agent bootstraps a workspace in place and iteratively rewrites the kernel for maximum performance — profile, edit, benchmark, repeat, until the kernel stops getting faster. The skill is a single `SKILL.md` protocol document; other coding agents can drive the same loop by following it directly.
+**AKO4ALL is automated Tenstorrent kernel optimization, packaged as a single [Claude Code](https://docs.anthropic.com/en/docs/claude-code) skill.** Drop a kernel into your working directory, invoke the skill, and the agent bootstraps a workspace in place and iteratively rewrites the kernel for maximum performance on a Tenstorrent device — profile, edit, benchmark, repeat, until the kernel stops getting faster. The skill is a single `SKILL.md` protocol document; other coding agents can drive the same loop by following it directly.
 
-<p align="center">
-  <img src="assets/hero.png" alt="A cartoon robot agent at a single workshop bench iterates on a glowing GPU kernel cube — with iteration logbook, profiler, timer, and commit stamp at hand, and a speedup chart on the chalkboard — illustrating AKO4ALL's single-session, drop-in kernel optimization loop." width="780" />
-</p>
+It targets both layers of the Tenstorrent stack:
 
-**AKO4ALL vs [AKO4X](https://github.com/TongmingLAIC/AKO4X)** — two sibling projects with different framings.
+- **TT-NN (ttnn)** — the PyTorch-like Python op library (op choice, dtype, layout, memory config / sharding, core grid, math fidelity, Metal Trace).
+- **tt-metal** — low-level C++ Tensix kernels (reader / compute / writer, circular buffers, matmul tiling, NoC data movement).
 
-- **Form:** AKO4ALL is a single Claude Code skill that runs in place in your working directory. AKO4X is a template repository that builds a fresh isolated child environment for each run.
-- **Unit of work:** AKO4ALL is *one continuous optimization run on one kernel* — resumable across chat sessions, but with no memory carried into the next run on the same kernel. AKO4X is a *multi-round campaign on one operator* — a persistent master agent spawns rounds back-to-back, and a per-operator archive accumulates each round's results so the Nth round is informed by all earlier rounds.
-- **Harness evolution:** AKO4ALL's protocol is static — you can supply behavior directives, but the skill itself does not change. AKO4X has an opt-in *harness co-evolution* mode in which the agent, after each round, can propose improvements to its own knowledge and tooling layer that the master gates and applies — no analogue here.
-
-Reach for AKO4ALL when you just want a kernel optimized; reach for AKO4X when you want infrastructure around the optimization.
+The reference is a plain PyTorch `class Model` run on the **CPU** as the numerical golden; the kernel under optimization runs on the **Tenstorrent device** and is scored by **PCC** (Pearson Correlation Coefficient) — the standard TT correctness metric — not a tight `torch.allclose`.
 
 ## What You Provide
 
 A kernel and at least one set of test inputs are required. Everything else is optional.
 
-- **Kernel** (required) — The kernel to optimize. Can be a single file or a directory. Supports Triton, CUDA, C++, TileLang, CuTe DSL, Python, or any language that can be benchmarked.
-- **Reference implementation** (optional) — Used as the correctness golden. If absent, the original kernel is used.
-- **Inputs** (at least one set required) — In any form: hardcoded inside the kernel/reference, defined in your benchmark script, a separate Python file with `get_inputs()`, or raw data files (`.npz`, `.bin`, shape lists, etc.) that the agent wires up itself. The agent assembles whatever is provided into something the bench script can call.
-- **Benchmark script** (optional) — Your own benchmark script; the agent reads it to figure out how to run it. If no benchmark script is provided, the built-in [KernelBench](https://github.com/ScalingIntelligence/KernelBench) evaluator is used automatically (no setup needed beyond PyTorch).
-- **Knowledge** (optional) — Reference materials for the agent: algorithm descriptions, papers, design docs, or any background knowledge that helps inform the optimization.
-- **Hints** (optional) — Directives for the agent: optimization constraints, focus areas, and behavior controls (e.g., whether to allow web search).
+- **Kernel** (required) — The kernel to optimize. A TT-NN solution (a Python file whose `forward` runs `ttnn` ops) or a tt-metal solution (a Python host wrapper launching C++ Tensix kernels).
+- **Reference implementation** (optional) — A PyTorch `class Model`, used as the correctness golden (run on CPU). If absent, the original kernel is used.
+- **Inputs** (at least one set required) — In any form: hardcoded in the kernel/reference, a `get_inputs()` function, or raw data files (`.npz`, `.pt`, `.bin`, shape lists, etc.) the agent wires up itself.
+- **Benchmark script** (optional) — Your own benchmark script; the agent reads it to figure out how to run it. If none is provided, the built-in Tenstorrent evaluator is used automatically.
+- **Knowledge** (optional) — Reference materials: algorithm descriptions, papers, design docs. The skill ships `knowledge/tenstorrent.md`, a TT stack cheat-sheet the agent reads.
+- **Hints** (optional) — Directives for the agent: optimization constraints, PCC floor, focus areas, behavior controls.
 
 ## Install
 
 Clone the repo directly into Claude Code's skills directory:
 
 ```bash
-git clone https://github.com/TongmingLAIC/AKO4ALL.git ~/.claude/skills/ako4all
+git clone <this-repo> ~/.claude/skills/ako4all
 ```
 
 Or, if you already have it cloned somewhere else, symlink it:
@@ -85,7 +77,7 @@ ln -s /path/to/AKO4ALL ~/.claude/skills/ako4all
 
 ### Mode 1 — Interactive (default)
 
-Open Claude Code in a directory containing your kernel, then ask it to optimize the kernel. Files in the working directory are inspected automatically; you can also point at external paths. Optional constraints — iteration cap, language preference, dependency policy, etc. — included in the prompt will be merged into `HINTS.md`.
+Open Claude Code in a directory containing your kernel, then ask it to optimize the kernel. Files in the working directory are inspected automatically; you can also point at external paths. Optional constraints — iteration cap, PCC floor, dtype preference, dependency policy, etc. — included in the prompt will be merged into `HINTS.md`.
 
 The skill presents a resolved plan, asks if anything is genuinely ambiguous, and starts iterating. You can interrupt at any point to redirect.
 
@@ -97,8 +89,9 @@ If you want the conventional layout the skill recognizes:
 ```
 <workspace>/
 ├── source/                      # Kernel + optional reference and inputs
-│   ├── kernel.py
-│   ├── reference.py             # Optional
+│   ├── kernel.py                #   TT-NN op or tt-metal host wrapper
+│   ├── kernels/*.cpp            #   (tt-metal) reader/compute/writer kernels
+│   ├── reference.py             # Optional — PyTorch golden (runs on CPU)
 │   └── inputs.py / data.npz ... # Optional — input data, any format
 ├── bench/                       # Your own benchmark script (optional)
 │   └── ...
@@ -114,63 +107,48 @@ These are conventions, not requirements. If your files are organized differently
 
 For optimizing several related kernels in parallel, in Claude Code the main agent can spawn one subagent per kernel via the `Task` tool.
 
-> ⚠️ **Subagents can't ask back.** In Claude Code, subagents lack `AskUserQuestion`. The main agent composes each subagent's prompt from your instructions plus what's in each kernel's directory; any decision you don't pin down there will fall to `SKILL.md` defaults. So include the things you care about (per-kernel paths, optional reference / inputs locations, language or iteration-cap constraints, custom branch names) — and let the rest default.
+> ⚠️ **Subagents can't ask back.** In Claude Code, subagents lack `AskUserQuestion`. The main agent composes each subagent's prompt from your instructions plus what's in each kernel's directory; any decision you don't pin down there will fall to `SKILL.md` defaults. So include the things you care about (per-kernel paths, optional reference / inputs locations, backend, PCC floor, iteration cap) — and let the rest default.
 
 ## Requirements
 
 - A coding agent (e.g., [Claude Code](https://docs.anthropic.com/en/docs/claude-code))
-- NVIDIA GPU with CUDA-enabled PyTorch (only for the built-in evaluator; a remote-execution bench script may not need either locally)
-- Python **>= 3.10** for the built-in evaluator (or whatever your custom bench script requires)
-- NVIDIA Nsight Compute (`ncu`) — recommended; its version must match your CUDA / PyTorch CUDA build. If unavailable, the loop still proceeds (no profiling — the agent reasons from runtime stats instead).
+- A **Tenstorrent device** (Wormhole or Blackhole) with a working [tt-metal / TT-NN](https://github.com/tenstorrent/tt-metal) install (`ttnn` importable). Set `TT_METAL_HOME`, `PYTHONPATH`, and `ARCH_NAME` (`wormhole_b0` / `blackhole`).
+- PyTorch (CPU) for the reference golden and the built-in evaluator; Python **>= 3.10**
+- The tt-metal **device profiler (Tracy)** — recommended for per-kernel profiling (built by default; enable at runtime with `TT_METAL_DEVICE_PROFILER=1`). If unavailable, the loop still proceeds (no device profiling — the agent reasons from runtime stats and roofline analysis instead).
 - Git
 
-> **Note:** During the loop the agent may run `pip install` / `apt install` etc. to fill in missing dependencies. A container or virtual environment is recommended for isolation; to forbid installs, add a directive to `HINTS.md` (see [Agent Behavior](#agent-behavior)) or restrict via [Permissions](#permissions).
+> **Note:** During the loop the agent may run `pip install` etc. to fill in missing dependencies. A container or virtual environment is recommended for isolation; to forbid installs, add a directive to `HINTS.md` (see [Agent Behavior](#agent-behavior)) or restrict via [Permissions](#permissions).
 
 ## How It Works
 
-The agent creates an `opt/<kernel>` branch, copies your kernel to `solution/`, and generates `scripts/bench.sh` to wrap your benchmark. After verifying the baseline (and profiling it with `ncu` if available), it iterates: edit `solution/` → benchmark → log → commit. After 3 stagnant iterations it re-profiles, plans the next direction, and continues. Defaults like the stall threshold live in `HINTS.md`; iteration history lives in `ITERATIONS.md`. See [`SKILL.md`](SKILL.md) for the full protocol.
+The agent creates an `opt/<kernel>` branch, copies your kernel to `solution/`, and generates `scripts/bench.sh` to wrap your benchmark. After verifying the baseline is correct (PCC ≥ threshold) — and profiling it with the tt-metal device profiler if available — it iterates: edit `solution/` → benchmark → log → commit. After 3 stagnant iterations it re-profiles, plans the next direction, and continues. Defaults like the stall threshold live in `HINTS.md`; iteration history lives in `ITERATIONS.md`. See [`SKILL.md`](SKILL.md) for the full protocol.
+
+The built-in evaluator ([`bench/kernelbench/`](bench/kernelbench/)) opens one TT device, runs the solution's `forward` on it (the solution does `ttnn.from_torch → ops → ttnn.to_torch` itself, using the injected `DEVICE` global), and scores it against the CPU golden with PCC. Timing is a host wall-clock bracketed by `ttnn.synchronize_device`, with the first (compile) run discarded.
 
 ## Results
 
-<details>
-<summary><b>A drop-in skill that turns one prompt into an expert-beating kernel in under an hour — a clean sweep over FlashInfer's expert on all 4 inference ops.</b></summary>
+Speedups on Tenstorrent depend heavily on the operator, the shapes, the data format, and the device generation (Wormhole vs Blackhole), so this adaptation ships **no fixed benchmark table** — the numbers you get are the numbers your op and device produce, reported per run as `RUNTIME` (solution device latency), `PCC` (accuracy), and `SPEEDUP`.
 
-<br>
+What the loop reports, and how it decides it is done:
 
-Driven by **Claude Opus 4.8** (1M context, max thinking effort), on four FlashInfer-Bench inference operators AKO4ALL rewrote the reference into Triton kernels that **all beat FlashInfer's strongest _expert_ kernel** — geomean speedup over the FlashInfer expert on NVIDIA B200, all correctness-passing:
+- **Per iteration:** the solution's own `RUNTIME` (lower is better) is the ranking signal; `PCC` gates correctness.
+- **Physical floors** (a legitimate stop): near the DRAM bandwidth ceiling for memory-bound kernels (Wormhole ≈ 288–336 GB/s, Blackhole ≈ 512 GB/s), or near matrix-engine peak for compute-bound kernels (Wormhole ≈ 190 TFLOPS, Blackhole ≈ 332 TFLOPS bf16 / 664 bfp8). See [`knowledge/tenstorrent.md`](knowledge/tenstorrent.md).
 
-| Operator | Speedup vs FlashInfer expert | Workloads |
-|---|---|---|
-| GQA paged decode | **1.36×** | 48 |
-| MLA paged decode | **1.21×** | 47 |
-| MLA paged prefill | **1.50×** | 38 |
-| RMSNorm h128 | **1.12×** | 14 |
-
-*All four operators we ran are shown here — we time-boxed this round to four kernels, so these are not the best four cherry-picked from a larger sweep.*
-
-**What one kernel takes to optimize** — a typical run, end-to-end from the initial prompt to the agent finishing:
-
-| End-to-end | Input | Output | Cache read | Cache write |
-|---|---|---|---|---|
-| ~55 min | ~15k | ~253k | ~17.6M | ~752k |
-
-A single drop-in skill — competitive-with-expert kernels in under an hour, from a single prompt.
-
-</details>
+The original NVIDIA/CUDA study and its FlashInfer-expert results live in the [upstream AKO project](https://tongminglaic.github.io/AKO).
 
 ## Agent Behavior
 
 A few defaults worth knowing:
 
-- **Language switching** — the agent may rewrite your kernel in a different language (e.g., Triton → CUDA) to chase performance.
-- **Web search** — enabled; the agent searches for optimization ideas after consecutive stagnant iterations.
-- **Profiling** — `ncu` runs on the baseline before iter-1 and again after 3 stagnant iterations.
+- **Rewriting, not just tuning** — the agent may change the data format / math fidelity (bf16 → bfloat8_b/bfloat4_b), restructure memory (L1 vs DRAM, sharding), retile, add Metal Trace, or drop a TT-NN op down to a hand-written tt-metal Tensix kernel to chase performance.
+- **Web search** — enabled; the agent searches for TT-specific optimization ideas after consecutive stagnant iterations.
+- **Profiling** — the tt-metal device profiler runs on the baseline before iter-1 and again after 3 stagnant iterations (when available).
 
-To adjust any of this — or to add your own directives (optimization constraints, dependency policies, iteration caps, ...) — edit `HINTS.md` in your workspace. The file is self-documenting.
+To adjust any of this — or to add your own directives (PCC floor, dtype constraints, dependency policies, iteration caps, ...) — edit `HINTS.md` in your workspace. The file is self-documenting.
 
 ## Permissions
 
-The optimization loop involves running shell commands (compiling, benchmarking, profiling). By default, most coding agents prompt for approval on each command. To run fully unattended, grant the necessary permissions through your agent's configuration.
+The optimization loop involves running shell commands (building, benchmarking, profiling). By default, most coding agents prompt for approval on each command. To run fully unattended, grant the necessary permissions through your agent's configuration.
 
 For Claude Code, the simplest option is to bypass all permission checks:
 
@@ -203,88 +181,76 @@ For other agents, consult their documentation on permission / auto-approve setti
 
 ```
 AKO4ALL/
-├── SKILL.md              # Entry point — loaded by Claude Code when the skill triggers
-├── HINTS.md              # Scaffold: agent behavior defaults
-├── ITERATIONS.md         # Scaffold: iteration log template
-├── bench-wrapper.sh      # Scaffold: bench script template
-└── bench/kernelbench/    # Scaffold: built-in KernelBench evaluator
+├── SKILL.md                  # Entry point — loaded by Claude Code when the skill triggers
+├── HINTS.md                  # Scaffold: agent behavior defaults
+├── ITERATIONS.md             # Scaffold: iteration log template
+├── bench-wrapper.sh          # Scaffold: bench script template (TT env checks)
+├── bench/kernelbench/        # Scaffold: built-in Tenstorrent evaluator (PCC + host timing)
+└── knowledge/tenstorrent.md  # TT stack cheat-sheet the agent reads
 ```
 
 Scaffold files are copied into each workspace on first bootstrap, never overwriting existing files. `README.md`, `LICENSE`, and `assets/` are project metadata — not installed anywhere.
 
-## Example: SOL-ExecBench
+## Example: optimize a TT-NN op
 
-[SOL-ExecBench](https://github.com/NVIDIA/SOL-ExecBench) contains 235 real-world DL kernel problems from NVIDIA. AKO4ALL can optimize any of them by pointing at the problem directory directly — no copying into a local workspace.
+Point the skill at a kernel and a PyTorch reference; it wires up the built-in evaluator and iterates.
 
-1. Install the skill (see [Install](#install)) and clone SOL-ExecBench separately. Set up its environment and `ncu` per its own instructions.
-
-2. Activate the SOL-ExecBench environment and open Claude Code in any working directory:
+1. Install the skill (see [Install](#install)) and make sure `ttnn` imports and a device is reachable:
 
    ```bash
-   claude
+   export TT_METAL_HOME=/path/to/tt-metal
+   export PYTHONPATH="$TT_METAL_HOME:$PYTHONPATH"
+   export ARCH_NAME=wormhole_b0
+   python -c "import ttnn; d=ttnn.open_device(device_id=0); ttnn.close_device(d); print('ok')"
    ```
 
-3. Give it a prompt (replace the paths and iteration cap):
+2. Open Claude Code in a directory with your kernel + reference and give it a prompt:
 
    ```
-   Optimize the kernel at <sol-bench>/data/benchmark/L1/001_attention_softmax_dropout_value_matmul_backward.
-   Bench with SOL-ExecBench at <sol-bench>; its dependencies are already installed.
-   Optimize for up to 30 iterations. Stop early only if all viable approaches are exhausted.
+   Optimize the ttnn matmul kernel in source/matmul.py against the PyTorch
+   reference in source/reference.py. Keep PCC >= 0.99. Optimize for up to
+   20 iterations; stop early only if a physical floor is reached.
    ```
 
-The skill resolves the external path, wraps SOL-ExecBench's bench command as `scripts/bench.sh`, and starts iterating.
+The skill resolves the paths, generates `scripts/bench.sh` (which runs `bench/kernelbench/bench.py`), verifies the baseline (PCC), profiles it with the device profiler, and starts iterating — trying bfloat8_b, L1 sharding, larger core grids, Metal Trace, and so on.
 
 ## Anti-Cheat
 
-Three layers of protection against the agent gaming the metric instead of achieving real speedup:
+Protection against the agent gaming the metric instead of achieving real speedup:
 
-1. **Agent rules.** The skill instructs the agent to pursue genuine latency reduction — no CUDA stream injection, no timing manipulation, no returning uninitialized results. Full list in [`SKILL.md`](SKILL.md) "Gotchas".
+1. **Agent rules.** The skill instructs the agent to pursue genuine latency reduction — no returning constant / precomputed / uninitialized tensors, no skipping the device round-trip, no monkey-patching the benchmark. Full list in [`SKILL.md`](SKILL.md) "Gotchas".
 
-2. **Evaluator checks** (built-in KernelBench). Flags suspicious >10× speedups for review, and strips any input-generating code (e.g., `get_inputs`) from the solution file before evaluation — so the solution can't choose what it's tested against.
+2. **Evaluator checks** (built-in). Correctness is PCC on **fresh random inputs each trial**, so a solution that doesn't actually compute the op fails. The evaluator strips any input-generating code (`get_inputs` / `get_init_inputs`) from the solution file before evaluation — so the solution can't choose what it's tested against.
 
-3. **Stricter enforcement** (optional). Provide a custom bench script with static analysis — e.g., KernelBench's [`kernel_static_checker.py`](https://github.com/ScalingIntelligence/KernelBench) — to reject solutions that contain disallowed patterns before they are even timed.
+3. **Stricter enforcement** (optional). Provide a custom bench script with additional static analysis or a tighter PCC threshold to reject solutions before they are timed.
 
 ## FAQ
 
-**1. Can I use AKO4ALL for a whole benchmark suite?**
-For ad-hoc optimization of several kernels at once, see [Mode 2](#mode-2--batch-via-subagents-advanced). For campaign-grade multi-round optimization — cross-run memory, an archive of variants feeding the next round, and master/sub agent separation — see [AKO4X](https://github.com/TongmingLAIC/AKO4X) (default benchmark: flashinfer-bench, swappable via adapter).
+**1. Which Tenstorrent devices are supported?**
+Wormhole and Blackhole (set `ARCH_NAME=wormhole_b0` / `blackhole`). Grayskull software support is discontinued upstream — don't target it.
 
-**2. My agent isn't trying hard enough — keeps tuning configs instead of rewriting.**
-Agent laziness is a known failure mode (staying in PyTorch, only tuning configurations, skipping profiling). Intervene with specific guidance, or add directives to `HINTS.md` ahead of time. The point of the loop is to *rewrite* the kernel — switch languages (Triton → CUDA, etc.) when it helps.
+**2. TT-NN or tt-metal — which does it optimize?**
+Both. The evaluator auto-detects the backend from the solution source (`ttnn` vs tt-metal C++ kernel markers). The agent may start at the ttnn op level and drop to a hand-written tt-metal kernel when that's where the speedup is.
 
-**3. Which model should I use?**
-Model capability strongly influences optimization quality. We recommend [Claude Opus](https://docs.anthropic.com/en/docs/about-claude/models).
+**3. Why PCC instead of `allclose`?**
+TT kernels run in bf16 / bfloat8_b, whose few mantissa bits make element-wise agreement with an fp32 golden to tight tolerance physically impossible. PCC (Pearson Correlation Coefficient) is the TT-standard correctness metric. Default gate 0.99; tighten to 0.999 / 0.9999 for fp32-accumulated ops.
 
-**4. How do I cap iterations?**
-By default there is no cap — the agent decides when to stop on its own. To enforce a limit, add a directive to `HINTS.md`, or include it in your prompt (e.g., `Optimize for up to 30 iterations. Stop early only if all viable approaches are exhausted.`).
+**4. The device profiler isn't set up. Does the loop still work?**
+Yes. Profiling is best-effort. Without it the agent reasons from the bench's runtime stats and roofline analysis (achieved GB/s vs DRAM ceiling, TFLOPS vs matrix-engine peak).
 
-**5. My bench script uses a remote service (e.g., Modal). Does that work?**
-Yes. As long as your bench script runs from the command line and prints results to stdout. The local machine doesn't need a GPU / CUDA / PyTorch in that case — just whatever your wrapper script imports.
+**5. How do I cap iterations?**
+By default there is no cap — the agent decides when to stop. To enforce a limit, add a directive to `HINTS.md`, or include it in your prompt (e.g., `Optimize for up to 20 iterations`).
 
-**6. Can I intervene during optimization?**
+**6. My bench runs on a remote / lab machine with the device. Does that work?**
+Yes, as long as your bench script runs from the command line and prints results to stdout. Edit `scripts/bench.sh` to `ssh`/activate the environment where the device lives.
+
+**7. Can I intervene during optimization?**
 Yes. Interrupt to redirect, or to manually edit files in `solution/` — then tell the agent to continue.
-
-## Tech Report
-
-The **[AKO tech report](https://tongminglaic.github.io/AKO/assets/ako-tech-report.pdf)** is now available.
-
-## Citation
-
-If you find AKO useful, please cite:
-
-```bibtex
-@misc{ako2026,
-  title        = {{AKO}: Agentic Kernel Optimization},
-  author       = {Shuxiao Xie and Shuyang Xie and Dezhi Ran and Wei Yang and Tao Xie},
-  year         = {2026},
-  howpublished = {\url{https://tongminglaic.github.io/AKO}},
-  note         = {Technical report}
-}
-```
 
 ## Acknowledgments
 
-We would like to thank the following open-source projects that inspired and supported the development of AKO:
+This project is a Tenstorrent adaptation of **AKO4ALL**. Thanks to:
 
-- [KernelBench](https://github.com/ScalingIntelligence/KernelBench) — for providing the benchmark and evaluation format used by AKO4ALL's built-in evaluator.
-- [autoresearch](https://github.com/karpathy/autoresearch) and [autokernel](https://github.com/RightNow-AI/autokernel) — AKO's design was inspired by their work on autonomous optimization loops.
+- [AKO / AKO4ALL](https://tongminglaic.github.io/AKO) — the upstream agentic kernel optimization project and protocol this adapts.
+- [KernelBench](https://github.com/ScalingIntelligence/KernelBench) — the benchmark and evaluation format the built-in evaluator derives from.
+- [tt-metal](https://github.com/tenstorrent/tt-metal) and its [tech reports](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports) — the source of the Tenstorrent profiling, correctness, data-format, layout, memory, and optimization knowledge encoded here.
