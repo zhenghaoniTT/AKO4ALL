@@ -12,10 +12,13 @@ Distilled from the [tt-metal tech reports](https://github.com/tenstorrent/tt-met
 
 **Generations & ceilings** (single-card):
 
-| | Tensix (compute) | L1/core | DRAM | DRAM BW | Peak matmul | Clock |
+| | Tensix (compute)† | L1/core | DRAM | DRAM BW | Peak matmul (by dtype)‡ | Clock |
 |---|---|---|---|---|---|---|
-| Wormhole (n150) | 64 (8×8) | ~1.5 MB | 12 GB, 12 banks | 288 GB/s (336 @14Gbps) | ~190 TFLOPS | 1.0 GHz |
-| Blackhole (p150) | 130 (13×10) | ~1.5 MB | 32 GB, 8 banks | ~512 GB/s | 332 TFLOPS bf16 / 664 bfp8 | 1.35 GHz |
+| Wormhole (n150) | ~64 (8×8) | ~1.5 MB | 12 GB, 12 banks | 288 GB/s (336 @14Gbps) | ~50 (bf16) / ~190 (bfp4) TFLOPS | 1.0 GHz |
+| Blackhole (p150) | ~120 (up to 13×10) | ~1.5 MB | 32 GB, 8 banks | ~512 GB/s | 332 (bf16) / 664 (bfp8) TFLOPS | 1.35 GHz |
+
+† Core counts are nominal/marketed; the **usable** Tensix grid varies with harvesting — query `device.compute_with_storage_grid_size()` at runtime rather than hard-coding it.
+‡ Matmul peak depends on data format **and** math fidelity (bf16 « bfp8 « bfp4 / LoFi). Compare achieved TFLOPS against the peak *for the dtype you actually run* — the high aggregate figures (e.g. WH ~190) are bfp4/LoFi, not bf16.
 
 Grayskull is **discontinued** — do not target it.
 Refs: [Blackhole](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports/Blackhole), [matrix_engine](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports/matrix_engine), [GEMM_FLOPS](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports/GEMM_FLOPS), [Saturating_DRAM_bandwidth](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports/Saturating_DRAM_bandwidth).
@@ -37,7 +40,7 @@ Tracy-based, built into tt-metal.
 
 - **Build** with the profiler — Tracy is **on by default**, so a plain `./build_metal.sh` includes it (`--disable-profiler` turns it off); tools land in `build/tools/profiler/bin/`. **Runtime gate:** `export TT_METAL_DEVICE_PROFILER=1` (off by default — readback adds overhead).
 - **Per-op device latency:** `cd $TT_METAL_HOME && ./tools/tracy/profile_this.py -n <name> -c "pytest <test>"` (or `python -m tracy -m pytest <test>`) → `generated/profiler/reports/ops_perf_results_<ts>.csv`. Key columns (ns): `DEVICE KERNEL DURATION` (primary), `DEVICE FW DURATION` (fixed overhead), `HOST DURATION` (dispatch), per-RISC `DEVICE {BRISC,NCRISC,TRISC0/1/2} KERNEL DURATION`, `DEVICE COMPUTE CB WAIT FRONT` (compute starved) / `CB RESERVE BACK` (compute back-pressured).
-- **Bottleneck metrics** (the `ncu --metrics` equivalent): `export TT_METAL_PROFILE_PERF_COUNTERS=47` (FPU|PACK|UNPACK|L1|INSTRN), run under `python -m tracy --profiler-capture-perf-counters=all`. Triage: **MATH/FPU/SFPU Util %** (compute-bound?), **Thread 0/1/2 Stall Rate %** (T0=unpack starvation, T1=math, T2=pack), **NOC vs Compute Balance %** (>60% NOC-bound), **Compute-to-Unpack Ratio** (<20% memory-bound), **L1 Total Bandwidth Util %**, **Fidelity Stall Rate** (HiFi cost).
+- **Bottleneck metrics** (the `ncu --metrics` equivalent): run under `python -m tracy --profiler-capture-perf-counters=all` (groups: `fpu,pack,unpack,l1_0,instrn`; `all` for everything). Triage: **MATH/FPU/SFPU Util %** (compute-bound?), **Thread 0/1/2 Stall Rate %** (T0=unpack starvation, T1=math, T2=pack), **NOC vs Compute Balance %** (>60% NOC-bound), **Compute-to-Unpack Ratio** (<20% memory-bound), **L1 Total Bandwidth Util %**, **Fidelity Stall Rate** (HiFi cost).
 - **Timeline:** Tracy WASM web viewer (auto-starts on `python -m tracy`, HTTP 8080) or Tracy GUI (port 8086).
 - **Do not** enable DPRINT / Watcher while profiling or timing — they perturb latency and conflict with `TT_METAL_DEVICE_PROFILER`.
 
@@ -62,7 +65,7 @@ ttnn.close_device(device)
 1. **Data format + math fidelity** — bf16 → **bfloat8_b** (HiFi2, ~1.5–1.8×) → **bfloat4_b** (LoFi, ~2–3.5×). Also halves/quarters DRAM & L1 traffic. Match fidelity to format (bfloat8_b→HiFi2, bf16→HiFi4). Re-check PCC after each downgrade. Ref: [data_formats](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports/data_formats).
 2. **Memory placement + sharding** — keep hot tensors in **L1** (`ttnn.L1_MEMORY_CONFIG`); shard to match access (`HEIGHT` row-wise, `WIDTH` column-wise, `BLOCK` matmul). For DRAM-bound reads, sharded + one reader per bank saturates bandwidth. Ref: [tensor_sharding](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports/tensor_sharding), [memory](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports/memory).
 3. **Layout** — keep compute inputs in `TILE_LAYOUT` (32×32); avoid `tilize`/`untilize` (`ttnn.to_layout`) round-trips; dims multiples of 32. Ref: [tensor_layouts](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports/tensor_layouts).
-4. **Core-grid occupancy** — use more Tensix cores (`core_grid` / `CoreRangeSet`; up to 64 WH, 130 BH). Balance tiles across the grid.
+4. **Core-grid occupancy** — use more Tensix cores (`core_grid` / `CoreRangeSet`; ~64 on WH n150, ~120 on BH — query `device.compute_with_storage_grid_size()` at runtime, since harvesting varies it). Balance tiles across the grid.
 5. **Circular-buffer double-buffering** — size CBs to hold >1 tile so the reader prefetches while compute consumes; split reader (RISCV_0) / writer (RISCV_1) on separate NoCs.
 6. **Metal Trace + multi-CQ + program cache** — `ttnn.begin_trace_capture`/`execute_trace` removes per-iteration host dispatch overhead; `num_command_queues=2` overlaps IO with compute; program cache eliminates recompiles. Biggest wins on small ops. Ref: [AdvancedPerformanceOptimizationsForModels](https://github.com/tenstorrent/tt-metal/tree/main/tech_reports/AdvancedPerformanceOptimizationsForModels).
 7. **Kernel fusion / matmul tiling** — fuse elementwise chains in the DST register (no CB round-trip); tune matmul `per_core_M/N`, `in0_block_w`, `out_subblock_h/w`; `fp32_dest_acc_en` only where accuracy needs it.
@@ -70,7 +73,7 @@ ttnn.close_device(device)
 ## Physical floors (for the "when to stop" decision)
 
 - **Memory-bound:** achieved GB/s = bytes moved / kernel time; near the DRAM ceiling (WH 288–336, BH ~512 GB/s) → done. Well-tuned readers hit >90%.
-- **Compute-bound:** achieved TFLOPS = 2·M·N·K / time; near peak (WH ~190, BH 332 bf16 / 664 bfp8) → done. Per-op utilization = ideal_cycles / actual_cycles.
+- **Compute-bound:** achieved TFLOPS = 2·M·N·K / time; near peak **for the dtype in use** (WH ~50 bf16 / ~190 bfp4; BH 332 bf16 / 664 bfp8) → done. Per-op utilization = ideal_cycles / actual_cycles.
 - **L1-resident** with no DRAM spills, or **dispatch overhead** dominating a small op after Metal Trace + multi-CQ, are also floors.
 
 ## Two kernel layers
